@@ -19,10 +19,11 @@ from datetime import datetime
 # Import semua fungsi yang udah dibuat di stock_screener.py
 # (file ini HARUS ada di folder yang sama)
 from stock_screener import (
-    fetch_data,
+    fetch_batch_data,
     compute_signals,
     compute_fundamental_score,
     compute_sentiment_score,
+    fetch_all_idx_tickers,
     WATCHLIST as DEFAULT_WATCHLIST,
 )
 
@@ -52,13 +53,23 @@ st.warning(
 
 st.sidebar.header("⚙️ Pengaturan")
 
-watchlist_text = st.sidebar.text_area(
-    "Watchlist saham (pisahkan pakai koma)",
-    value=", ".join(DEFAULT_WATCHLIST),
-    height=120,
-    help="Format: KODESAHAM.JK — misal BBCA.JK, TLKM.JK",
+scan_all = st.sidebar.checkbox(
+    "🌐 Scan SEMUA saham IDX (~900+)",
+    value=False,
+    help="Kalau dicentang, watchlist di bawah diabaikan dan semua saham IDX yang "
+         "tercatat bakal di-scan. Prosesnya jauh lebih lama (bisa beberapa menit).",
 )
-watchlist = [t.strip().upper() for t in watchlist_text.split(",") if t.strip()]
+
+if scan_all:
+    st.sidebar.info("Mode: scan semua saham IDX. Watchlist manual di bawah di-nonaktifkan.")
+    watchlist_text = ""
+else:
+    watchlist_text = st.sidebar.text_area(
+        "Watchlist saham (pisahkan pakai koma)",
+        value=", ".join(DEFAULT_WATCHLIST),
+        height=120,
+        help="Format: KODESAHAM.JK — misal BBCA.JK, TLKM.JK",
+    )
 
 min_score = st.sidebar.slider(
     "Skor minimum ditampilkan",
@@ -69,7 +80,9 @@ min_score = st.sidebar.slider(
 run_button = st.sidebar.button("🔍 Jalankan Screening", type="primary", use_container_width=True)
 
 st.sidebar.markdown("---")
-st.sidebar.caption(f"Jumlah saham di watchlist: {len(watchlist)}")
+if not scan_all:
+    watchlist_preview = [t.strip().upper() for t in watchlist_text.split(",") if t.strip()]
+    st.sidebar.caption(f"Jumlah saham di watchlist: {len(watchlist_preview)}")
 
 # =========================================================================
 # AREA UTAMA - HASIL SCREENING
@@ -82,32 +95,45 @@ if "results" not in st.session_state:
     st.session_state.last_run = None
 
 if run_button:
+    if scan_all:
+        with st.spinner("Mengambil daftar semua saham IDX..."):
+            watchlist = fetch_all_idx_tickers()
+        if not watchlist:
+            st.error("Gagal mengambil daftar saham IDX. Cek koneksi internet, atau coba lagi nanti.")
+            st.stop()
+        st.caption(f"Ditemukan {len(watchlist)} saham tercatat di IDX.")
+    else:
+        watchlist = [t.strip().upper() for t in watchlist_text.split(",") if t.strip()]
+
     results = []
-    progress_bar = st.progress(0, text="Memulai screening...")
+    progress_bar = st.progress(0, text="Memulai screening (mode batch)...")
 
-    for i, ticker in enumerate(watchlist):
+    batch_size = 50
+    total_batches = (len(watchlist) + batch_size - 1) // batch_size
+
+    for b in range(total_batches):
+        batch = watchlist[b * batch_size: (b + 1) * batch_size]
         progress_bar.progress(
-            (i + 1) / len(watchlist),
-            text=f"Memproses {ticker} ({i + 1}/{len(watchlist)})...",
+            (b + 1) / total_batches,
+            text=f"Memproses batch {b + 1}/{total_batches} ({len(batch)} saham)...",
         )
-        df = fetch_data(ticker)
-        if df.empty:
-            continue
+        batch_data = fetch_batch_data(batch)
 
-        tech = compute_signals(df)
-        fund = compute_fundamental_score(ticker)
-        sent = compute_sentiment_score(ticker)
+        for ticker, df in batch_data.items():
+            tech = compute_signals(df)
+            fund = compute_fundamental_score(ticker)
+            sent = compute_sentiment_score(ticker)
 
-        total_score = tech["score"] + fund["score"] + sent["score"]
-        all_reasons = tech["reasons"] + fund["reasons"] + sent["reasons"]
+            total_score = tech["score"] + fund["score"] + sent["score"]
+            all_reasons = tech["reasons"] + fund["reasons"] + sent["reasons"]
 
-        results.append({
-            "Ticker": ticker,
-            "Harga": tech["price"],
-            "Skor": total_score,
-            "RSI": round(tech["rsi"], 1),
-            "Alasan": ", ".join(all_reasons) if all_reasons else "-",
-        })
+            results.append({
+                "Ticker": ticker,
+                "Harga": tech["price"],
+                "Skor": total_score,
+                "RSI": round(tech["rsi"], 1),
+                "Alasan": ", ".join(all_reasons) if all_reasons else "-",
+            })
 
     progress_bar.empty()
     st.session_state.results = pd.DataFrame(results)
