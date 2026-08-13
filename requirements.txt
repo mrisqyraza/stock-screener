@@ -1,0 +1,183 @@
+// ═══════════════════════════════════════════════════
+// Mini Mining — Google Apps Script (v2)
+// Sheet ID: 12SFLBThzDxyWWtuf3KrY3Q8BVqslW8B8UnyaQ5_JijW9ZE
+// Deploy sebagai: Web App → Anyone can access
+// ═══════════════════════════════════════════════════
+
+var SHEET_ID = "12SFLBThzDxyWWtuf3KrY3Q8BVqslW8B8UnyaQ5_JijW9ZE";
+
+function doPost(e) {
+  try {
+    var data;
+    if (e && e.postData && e.postData.contents) {
+      data = JSON.parse(e.postData.contents);
+    } else if (e && e.parameter) {
+      data = e.parameter;
+    } else {
+      return _resp({ ok: false, error: "No data received" });
+    }
+
+    var ss = SpreadsheetApp.openById(SHEET_ID);
+
+    if (data.action === "push") {
+      return _push(ss, data);
+    } else if (data.action === "pull") {
+      return _pull(ss);
+    } else {
+      return _resp({ ok: false, error: "Unknown action: " + data.action });
+    }
+  } catch(err) {
+    return _resp({ ok: false, error: err.message });
+  }
+}
+
+function doGet(e) {
+  try {
+    var ss = SpreadsheetApp.openById(SHEET_ID);
+    if (e && e.parameter && e.parameter.action === "pull") {
+      return _pull(ss);
+    }
+    return _resp({ ok: true, status: "Mini Mining API aktif ✅", sheetId: SHEET_ID });
+  } catch(err) {
+    return _resp({ ok: false, error: err.message });
+  }
+}
+
+function _push(ss, data) {
+  var logSheet  = ss.getSheetByName("Log Sesi")  || ss.insertSheet("Log Sesi");
+  var metaSheet = ss.getSheetByName("Rekap")      || ss.insertSheet("Rekap");
+
+  // Header Log Sesi
+  if (logSheet.getLastRow() === 0) {
+    logSheet.appendRow(["Waktu", "Unit", "Tipe", "Durasi (mnt)", "Harga (Rp)", "User", "Tanggal"]);
+    logSheet.getRange(1, 1, 1, 7).setFontWeight("bold").setBackground("#EF9F27").setFontColor("#ffffff");
+    logSheet.setFrozenRows(1);
+  }
+
+  // Tulis sesi
+  var sessions = data.sessions || [];
+  sessions.forEach(function(s) {
+    logSheet.appendRow([
+      s.time || "",
+      s.name || "",
+      s.type === "fb" ? "Foosball Bill" : "Mini Mining",
+      Math.round((s.dur || 0) / 60),
+      s.price || 0,
+      data.user || "Operator",
+      data.date || ""
+    ]);
+  });
+
+  // Header Rekap
+  if (metaSheet.getLastRow() === 0) {
+    metaSheet.appendRow(["Tanggal", "Total Pendapatan (Rp)", "Sesi Foosball", "Rev Foosball (Rp)", "Sesi Mining", "Rev Mining (Rp)", "User Terakhir"]);
+    metaSheet.getRange(1, 1, 1, 7).setFontWeight("bold").setBackground("#1D9E75").setFontColor("#ffffff");
+    metaSheet.setFrozenRows(1);
+  }
+
+  // Update atau append baris rekap berdasarkan tanggal
+  var targetDate = data.date || "";
+  var lastRow = metaSheet.getLastRow();
+  var updated = false;
+
+  if (lastRow > 1) {
+    var dates = metaSheet.getRange(2, 1, lastRow - 1, 1).getValues();
+    for (var i = 0; i < dates.length; i++) {
+      if (String(dates[i][0]) === targetDate) {
+        metaSheet.getRange(i + 2, 1, 1, 7).setValues([[
+          targetDate,
+          data.totalRevenue || 0,
+          data.sesFB || 0,
+          data.revFB || 0,
+          data.sesMM || 0,
+          data.revMM || 0,
+          data.user || "Operator"
+        ]]);
+        updated = true;
+        break;
+      }
+    }
+  }
+
+  if (!updated) {
+    metaSheet.appendRow([
+      targetDate,
+      data.totalRevenue || 0,
+      data.sesFB || 0,
+      data.revFB || 0,
+      data.sesMM || 0,
+      data.revMM || 0,
+      data.user || "Operator"
+    ]);
+  }
+
+  // Format kolom angka di Rekap
+  var rLastRow = metaSheet.getLastRow();
+  if (rLastRow > 1) {
+    metaSheet.getRange(2, 2, rLastRow - 1, 1).setNumberFormat("#,##0");
+    metaSheet.getRange(2, 4, rLastRow - 1, 1).setNumberFormat("#,##0");
+    metaSheet.getRange(2, 6, rLastRow - 1, 1).setNumberFormat("#,##0");
+  }
+
+  return _resp({ ok: true, pushed: sessions.length, date: targetDate });
+}
+
+function _pull(ss) {
+  var metaSheet = ss.getSheetByName("Rekap");
+  var logSheet  = ss.getSheetByName("Log Sesi");
+  var recap = [], users = [];
+
+  if (metaSheet && metaSheet.getLastRow() > 1) {
+    var rows = metaSheet.getDataRange().getValues();
+    rows.slice(1).forEach(function(r) {
+      recap.push({
+        date: String(r[0]),
+        totalRevenue: r[1],
+        sesFB: r[2],
+        revFB: r[3],
+        sesMM: r[4],
+        revMM: r[5],
+        user: r[6]
+      });
+    });
+  }
+
+  if (logSheet && logSheet.getLastRow() > 1) {
+    var logRows = logSheet.getDataRange().getValues();
+    var seen = {};
+    logRows.slice(1).forEach(function(r) {
+      var u = r[5];
+      if (u && !seen[u]) {
+        seen[u] = r[0];
+        users.push({ user: u, lastSeen: String(r[0]) });
+      }
+    });
+  }
+
+  return _resp({ ok: true, recap: recap, users: users });
+}
+
+function _resp(obj) {
+  return ContentService
+    .createTextOutput(JSON.stringify(obj))
+    .setMimeType(ContentService.MimeType.JSON);
+}
+
+// ════════════════════════════════════════
+// Jalankan fungsi ini dari editor untuk test
+// ════════════════════════════════════════
+function testKoneksi() {
+  try {
+    var ss = SpreadsheetApp.openById(SHEET_ID);
+    Logger.log("✅ Berhasil terhubung! Nama file: " + ss.getName());
+    Logger.log("Sheet tersedia: " + ss.getSheets().map(function(s){ return s.getName(); }).join(", "));
+  } catch(e) {
+    Logger.log("❌ Gagal: " + e.message);
+ 
+streamlit
+yfinance
+pandas
+numpy
+ta
+scipy
+requests
