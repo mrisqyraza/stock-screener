@@ -23,6 +23,8 @@ import pandas as pd
 import numpy as np
 import ta
 import requests
+import time
+import io
 from datetime import datetime
 
 # =========================================================================
@@ -76,13 +78,70 @@ RSI_OVERSOLD = 35
 VOLUME_SPIKE_MULTIPLIER = 1.8   # volume hari ini vs rata-rata 20 hari
 LOOKBACK_DAYS = "3mo"
 
+# Ukuran batch buat download data sekaligus. Jangan diset terlalu besar
+# (Yahoo Finance bisa nolak/rate-limit kalau kebanyakan dalam 1 request).
+BATCH_SIZE = 50
+BATCH_DELAY_SECONDS = 1.5  # jeda antar batch, biar "sopan" ke server
+
+
+# =========================================================================
+# MODUL AMBIL SEMUA TICKER IDX (opsional, buat scan semua saham)
+# =========================================================================
+
+# Sumber: dataset publik emiten IDX (kode, nama, papan pencatatan).
+# Diambil live tiap kali fungsi ini dipanggil, BUKAN disimpan hardcode di sini,
+# supaya datanya selalu yang paling baru dan reponya nggak berat.
+IDX_ALL_TICKERS_URL = "https://raw.githubusercontent.com/wildangunawan/Dataset-Saham-IDX/master/List%20Emiten/all.csv"
+
+
+def fetch_all_idx_tickers(exclude_boards: list = None) -> list:
+    """
+    Ambil daftar SEMUA kode saham yang tercatat di IDX (~900+ ticker),
+    lalu tambahin suffix .JK biar siap dipakai yfinance.
+
+    exclude_boards: papan pencatatan yang mau di-skip, misal
+      ["Pemantauan Khusus"] buat exclude saham yang lagi dalam pengawasan khusus.
+      Default: nggak exclude apa-apa (ambil semua).
+
+    Kalau gagal ambil (nggak ada internet / sumbernya down), fungsi ini
+    return list kosong dan kasih tau lewat print — jangan bikin program
+    crash total gara-gara ini.
+    """
+    try:
+        resp = requests.get(IDX_ALL_TICKERS_URL, timeout=15)
+        resp.raise_for_status()
+        df = pd.read_csv(io.StringIO(resp.text))
+    except Exception as e:
+        print(f"[ERROR] Gagal ambil daftar semua ticker IDX: {e}")
+        return []
+
+    if exclude_boards:
+        df = df[~df["listingBoard"].isin(exclude_boards)]
+
+    tickers = [f"{code.strip()}.JK" for code in df["code"].astype(str)]
+    return tickers
+
+
+# Set True kalau mau screening SEMUA saham IDX, bukan cuma LQ45 + konglomerat.
+# HATI-HATI: ini bakal narik ~900 saham, proses jauh lebih lama (beberapa menit)
+# meskipun udah pakai batch download.
+SCAN_SEMUA_SAHAM_IDX = False
+
+if SCAN_SEMUA_SAHAM_IDX:
+    _all_tickers = fetch_all_idx_tickers()
+    if _all_tickers:
+        WATCHLIST = sorted(set(_all_tickers))
+    # kalau gagal ambil (nggak ada internet dsb), WATCHLIST tetap
+    # pakai LQ45 + konglomerat yang udah didefinisikan di atas (fallback aman)
+
 
 # =========================================================================
 # MODUL TEKNIKAL
 # =========================================================================
 
 def fetch_data(ticker: str) -> pd.DataFrame:
-    """Ambil data OHLCV historis (delayed) dari Yahoo Finance."""
+    """Ambil data OHLCV historis (delayed) dari Yahoo Finance - SATU ticker.
+    Masih dipakai kalau kamu butuh ambil 1 saham doang secara terpisah."""
     df = yf.download(ticker, period=LOOKBACK_DAYS, interval="1d", progress=False)
     if df.empty or len(df) < 30:
         return pd.DataFrame()
@@ -90,6 +149,57 @@ def fetch_data(ticker: str) -> pd.DataFrame:
     if isinstance(df.columns, pd.MultiIndex):
         df.columns = df.columns.get_level_values(0)
     return df
+
+
+def fetch_batch_data(tickers: list, batch_size: int = None, delay: float = None) -> dict:
+    """
+    Ambil data OHLCV buat BANYAK ticker sekaligus, dipecah jadi batch kecil.
+
+    Ini jauh lebih cepat daripada fetch_data() satu-satu, dan lebih aman
+    dari resiko rate-limit karena requestnya nggak sekaligus semua.
+
+    Return: dict {ticker: dataframe}. Ticker yang datanya gagal/kurang
+    otomatis di-skip (nggak bikin keseluruhan proses berhenti).
+    """
+    batch_size = batch_size or BATCH_SIZE
+    delay = delay if delay is not None else BATCH_DELAY_SECONDS
+
+    result = {}
+    total_batches = (len(tickers) + batch_size - 1) // batch_size
+
+    for b in range(total_batches):
+        batch = tickers[b * batch_size: (b + 1) * batch_size]
+        print(f"[INFO] Batch {b + 1}/{total_batches} ({len(batch)} ticker)...")
+
+        try:
+            if len(batch) == 1:
+                # yfinance beda formatnya kalau cuma 1 ticker
+                raw = yf.download(batch[0], period=LOOKBACK_DAYS, interval="1d", progress=False)
+                candidates = {batch[0]: raw}
+            else:
+                raw = yf.download(
+                    batch, period=LOOKBACK_DAYS, interval="1d",
+                    group_by="ticker", progress=False, threads=True,
+                )
+                candidates = {t: (raw[t] if t in raw.columns.get_level_values(0) else pd.DataFrame())
+                              for t in batch}
+        except Exception as e:
+            print(f"[ERROR] Batch {b + 1} gagal total: {e}")
+            continue
+
+        for ticker, df in candidates.items():
+            df = df.dropna(how="all")
+            if isinstance(df.columns, pd.MultiIndex):
+                df.columns = df.columns.get_level_values(0)
+            if not df.empty and len(df) >= 30:
+                result[ticker] = df
+
+        # jeda antar batch (skip kalau ini batch terakhir)
+        if b < total_batches - 1:
+            time.sleep(delay)
+
+    print(f"[INFO] Selesai: {len(result)}/{len(tickers)} ticker berhasil diambil datanya.")
+    return result
 
 
 def check_bollinger_riding(df: pd.DataFrame, days_check: int = 3) -> bool:
@@ -331,14 +441,12 @@ def compute_sentiment_score(ticker: str) -> dict:
 
 def run_screener():
     print(f"=== Screening dijalankan: {datetime.now()} ===")
+    print(f"Total saham di watchlist: {len(WATCHLIST)}")
+
+    batch_data = fetch_batch_data(WATCHLIST)
     results = []
 
-    for ticker in WATCHLIST:
-        df = fetch_data(ticker)
-        if df.empty:
-            print(f"[SKIP] {ticker}: data tidak cukup")
-            continue
-
+    for ticker, df in batch_data.items():
         tech = compute_signals(df)
         fund = compute_fundamental_score(ticker)
         sent = compute_sentiment_score(ticker)
