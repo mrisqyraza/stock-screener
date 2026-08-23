@@ -477,6 +477,7 @@ def fetch_macro_context() -> dict:
 
 
 
+def _evaluate_conditions(conditions: list) -> tuple:
     """Helper: dari list kondisi, hitung apakah SEMUA lolos, susun bukti."""
     all_passed = all(c["passed"] for c in conditions)
     return all_passed, conditions
