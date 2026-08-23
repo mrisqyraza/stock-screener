@@ -1,0 +1,748 @@
+"""
+IDX Stock Screener - Versi Web (Streamlit)
+=============================================
+Ini "kulit" web dari stock_screener.py. Logika screening-nya SAMA PERSIS,
+cuma ditampilkan lewat browser, bukan lewat teks di Command Prompt.
+
+Cara pakai:
+1. Pastikan file ini ada di FOLDER YANG SAMA dengan stock_screener.py
+2. pip install streamlit plotly  (kalau belum)
+3. Jalankan lewat Command Prompt: streamlit run web_app.py
+   (BUKAN "python web_app.py" - Streamlit punya cara jalanin sendiri)
+4. Browser bakal kebuka otomatis ke http://localhost:8501
+"""
+
+import streamlit as st
+import pandas as pd
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+from datetime import datetime
+import time
+
+# Import semua fungsi yang udah dibuat di stock_screener.py
+# (file ini HARUS ada di folder yang sama)
+from stock_screener import (
+    fetch_batch_data,
+    fetch_data,
+    compute_signals,
+    compute_screener_results,
+    compute_fundamental_score,
+    compute_trade_levels,
+    find_support_resistance,
+    fetch_all_idx_tickers,
+    fetch_macro_context,
+    check_leading_lagging,
+    compute_bandarmology_score,
+    GOAPI_API_KEY,
+    KONGLOMERAT_GROUPS,
+    INDICATOR_DESCRIPTIONS,
+    WATCHLIST as DEFAULT_WATCHLIST,
+)
+
+# Indikator SKOR tambahan (di luar 3 screener utama) yang bisa dipilih user.
+AVAILABLE_INDICATORS = {
+    "rsi_oversold": "RSI Oversold",
+    "macd_cross": "MACD Golden Cross",
+    "volume_spike": "Volume Spike",
+    "above_ma20": "Harga di atas MA20",
+    "uptrend_ma": "MA20 > MA50 (uptrend)",
+    "bollinger_riding": "Riding Upper Bollinger Band",
+    "near_support": "Dekat Area Support",
+    "vcp_pattern": "Pola VCP",
+    "ema_riding": "EMA9 Riding",
+    "stochrsi_support": "StochRSI Oversold di Support",
+    "sr_role_reversal": "Support/Resistance Role Reversal",
+    "range_sideways": "Sedang Sideways/Ranging",
+}
+
+# 3 screener utama. Saham ditampilkan kalau lolos SALAH SATU screener
+# yang dicentang aktif. Watchlist-nya SELALU pakai LQ45 + konglomerat
+# bawaan dari stock_screener.py (nggak ada lagi input manual).
+SCREENER_INFO = {
+    "day_trade": {
+        "label": "📊 Day Trade",
+        "help": "Volume ≥1.5x rata-rata, MACD histogram positif, harga di atas MA20, "
+                "RSI 40-70, value transaksi > Rp1 miliar.",
+    },
+    "bsjp": {
+        "label": "🌆 BSJP (Beli Sore Jual Pagi)",
+        "help": "Naik ≥5%, volume breakout ≥2x MA20, harga di atas MA5 & Open, "
+                "value transaksi > Rp5 miliar, bukan saham gocap.",
+    },
+    "bpjs": {
+        "label": "🌅 BPJS (Beli Pagi Jual Sore)",
+        "help": "Versi lebih longgar dari BSJP, biasa dicek 30 menit sebelum market buka.",
+    },
+}
+
+# Mapping indikator mana yang "senasib" konsepnya sama tiap screener -
+# dipakai buat auto-centang dua arah (screener <-> indikator).
+SCREENER_INDICATOR_MAP = {
+    "day_trade": ["volume_spike", "macd_cross", "above_ma20"],
+    "bsjp": ["volume_spike", "above_ma20", "ema_riding"],
+    "bpjs": ["volume_spike", "ema_riding"],
+}
+
+# Reverse map: tiap indikator -> daftar screener yang memuatnya.
+INDICATOR_TO_SCREENERS = {}
+for _scr_key, _ind_keys in SCREENER_INDICATOR_MAP.items():
+    for _ind_key in _ind_keys:
+        INDICATOR_TO_SCREENERS.setdefault(_ind_key, []).append(_scr_key)
+
+
+def sync_indicators_from_screener(screener_key: str):
+    """Callback: pas screener dicentang, auto-centang indikator yang terkait."""
+    if st.session_state.get(f"scr_{screener_key}"):
+        for ind_key in SCREENER_INDICATOR_MAP.get(screener_key, []):
+            st.session_state[f"chk_{ind_key}"] = True
+
+
+def sync_screener_from_indicator(indicator_key: str):
+    """Callback: pas indikator dicentang, auto-centang screener yang terkait."""
+    if st.session_state.get(f"chk_{indicator_key}"):
+        for screener_key in INDICATOR_TO_SCREENERS.get(indicator_key, []):
+            st.session_state[f"scr_{screener_key}"] = True
+
+
+def build_evidence_chart(df: pd.DataFrame, ticker: str, trade_levels: dict = None, highlight_label: str = None):
+    """
+    Bikin grafik candlestick + MA5/MA20 + volume + garis support/resistance
+    + level TP/SL, sebagai BUKTI VISUAL. Kalau highlight_label diisi, kasih
+    penanda panah di candle terakhir nunjukkin kriteria mana yang lagi dipilih.
+    """
+    chart_df = df.tail(90)
+
+    fig = make_subplots(
+        rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.03,
+        row_heights=[0.75, 0.25],
+        subplot_titles=(f"{ticker} — Harga, MA & Level Trading", "Volume"),
+    )
+
+    fig.add_trace(go.Candlestick(
+        x=chart_df.index, open=chart_df["Open"], high=chart_df["High"],
+        low=chart_df["Low"], close=chart_df["Close"], name="Harga",
+    ), row=1, col=1)
+
+    ma5 = df["Close"].rolling(5).mean().tail(90)
+    ma20 = df["Close"].rolling(20).mean().tail(90)
+    fig.add_trace(go.Scatter(x=chart_df.index, y=ma5, name="MA5",
+                              line=dict(color="orange", width=1.3)), row=1, col=1)
+    fig.add_trace(go.Scatter(x=chart_df.index, y=ma20, name="MA20",
+                              line=dict(color="blue", width=1.3)), row=1, col=1)
+
+    try:
+        sr = find_support_resistance(df)
+        for lvl in sr.get("support", []):
+            fig.add_hline(y=lvl, line_dash="dot", line_color="gray", opacity=0.4, row=1, col=1)
+        for lvl in sr.get("resistance", []):
+            fig.add_hline(y=lvl, line_dash="dot", line_color="gray", opacity=0.4, row=1, col=1)
+    except Exception:
+        pass
+
+    if trade_levels:
+        fig.add_hline(y=trade_levels["support"], line_dash="solid", line_color="#2ecc71",
+                      opacity=0.8, annotation_text=f"Support {trade_levels['support']:.0f}",
+                      annotation_position="left", row=1, col=1)
+        fig.add_hline(y=trade_levels["stop_loss"], line_dash="solid", line_color="#e74c3c",
+                      opacity=0.8, annotation_text=f"Stop Loss {trade_levels['stop_loss']:.0f}",
+                      annotation_position="left", row=1, col=1)
+        fig.add_hline(y=trade_levels["take_profit_1"], line_dash="dash", line_color="#3498db",
+                      opacity=0.8, annotation_text=f"TP1 {trade_levels['take_profit_1']:.0f}",
+                      annotation_position="left", row=1, col=1)
+        fig.add_hline(y=trade_levels["take_profit_2"], line_dash="dash", line_color="#9b59b6",
+                      opacity=0.8, annotation_text=f"TP2 {trade_levels['take_profit_2']:.0f}",
+                      annotation_position="left", row=1, col=1)
+
+    if highlight_label:
+        last_date = chart_df.index[-1]
+        last_high = chart_df["High"].iloc[-1]
+        fig.add_annotation(
+            x=last_date, y=last_high, text=f"📍 {highlight_label}",
+            showarrow=True, arrowhead=2, arrowcolor="black", arrowwidth=2,
+            ax=0, ay=-60, bgcolor="#FFF3CD", bordercolor="black", borderwidth=1,
+            font=dict(size=12), row=1, col=1,
+        )
+
+    vol_colors = ["#2ecc71" if c >= o else "#e74c3c"
+                  for c, o in zip(chart_df["Close"], chart_df["Open"])]
+    fig.add_trace(go.Bar(x=chart_df.index, y=chart_df["Volume"], name="Volume",
+                          marker_color=vol_colors), row=2, col=1)
+
+    fig.update_layout(
+        height=560, xaxis_rangeslider_visible=False,
+        showlegend=True, margin=dict(l=10, r=10, t=40, b=10),
+    )
+    return fig
+
+
+# =========================================================================
+# PENGATURAN TAMPILAN HALAMAN
+# =========================================================================
+
+st.set_page_config(page_title="KingBill Stock Screener", page_icon="👑", layout="wide")
+
+# --- Splash screen singkat, muncul sekali per sesi ---
+if "intro_shown" not in st.session_state:
+    st.session_state.intro_shown = False
+
+if not st.session_state.intro_shown:
+    intro_placeholder = st.empty()
+    intro_placeholder.markdown(
+        """
+        <style>
+        @keyframes fadeScaleIn {
+            0%   { opacity: 0; transform: scale(0.85); }
+            60%  { opacity: 1; transform: scale(1.03); }
+            100% { opacity: 1; transform: scale(1); }
+        }
+        @keyframes shimmer {
+            0%   { background-position: -200% center; }
+            100% { background-position: 200% center; }
+        }
+        .kb-intro-wrap {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            height: 60vh;
+            text-align: center;
+            animation: fadeScaleIn 1.1s ease-out;
+        }
+        .kb-crown {
+            font-size: 3.2rem;
+            margin-bottom: 0.2rem;
+            animation: fadeScaleIn 1.1s ease-out;
+        }
+        .kb-title {
+            font-size: 2.6rem;
+            font-weight: 800;
+            letter-spacing: 2px;
+            background: linear-gradient(90deg, #B8860B, #FFD700, #FFF3B0, #FFD700, #B8860B);
+            background-size: 400% auto;
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text;
+            animation: shimmer 2.5s linear infinite;
+            margin: 0;
+        }
+        .kb-subtitle {
+            font-size: 1.05rem;
+            color: #888;
+            margin-top: 0.6rem;
+            letter-spacing: 1px;
+        }
+        </style>
+        <div class="kb-intro-wrap">
+            <div class="kb-crown">👑</div>
+            <p class="kb-title">WELCOME TO<br>KINGBILL STOCK SCREENER</p>
+            <p class="kb-subtitle">Instrumen screening saham IDX — sedang menyiapkan...</p>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+    time.sleep(2.2)
+    intro_placeholder.empty()
+    st.session_state.intro_shown = True
+
+st.title("👑 KingBill Stock Screener")
+st.caption("Instrumen screening berbasis sinyal teknikal — bukan rekomendasi investasi")
+
+st.warning(
+    "⚠️ Ini alat bantu screening berbasis indikator teknikal historis, BUKAN prediksi "
+    "harga yang pasti. Data delay 15-20 menit. Level TP/SL dihitung dari support/resistance "
+    "historis, bukan jaminan harga akan bergerak ke situ. Selalu riset tambahan sebelum "
+    "ambil keputusan trading."
+)
+
+# =========================================================================
+# SIDEBAR - PENGATURAN (di kiri layar)
+# =========================================================================
+
+st.sidebar.header("⚙️ Pengaturan")
+
+scan_all = st.sidebar.checkbox(
+    "🌐 Scan SEMUA saham IDX (~900+)",
+    value=False,
+    help="Kalau dicentang, semua saham IDX yang tercatat bakal di-scan. "
+         "Kalau nggak, pakai daftar bawaan LQ45 + saham konglomerat "
+         "(lihat WATCHLIST di stock_screener.py). Prosesnya jauh lebih "
+         "lama kalau scan semua (bisa beberapa menit).",
+)
+
+st.sidebar.caption(
+    f"Mode: {'Semua saham IDX (~900+)' if scan_all else f'Watchlist bawaan ({len(DEFAULT_WATCHLIST)} saham: LQ45 + konglomerat)'}"
+)
+
+st.sidebar.markdown("---")
+st.sidebar.subheader("🎯 Pilih Screener")
+st.sidebar.caption(
+    "Saham ditampilkan kalau lolos SALAH SATU screener yang dicentang. "
+    "Centang screener otomatis ikut nyentang indikator terkait di bawah, "
+    "dan sebaliknya."
+)
+
+active_screeners = []
+for key, info in SCREENER_INFO.items():
+    checked = st.sidebar.checkbox(
+        info["label"], value=True, help=info["help"], key=f"scr_{key}",
+        on_change=sync_indicators_from_screener, args=(key,),
+    )
+    if checked:
+        active_screeners.append(key)
+
+st.sidebar.markdown("---")
+st.sidebar.subheader("✅ Indikator Skor Tambahan")
+st.sidebar.caption("Di luar screener utama - nambah poin skor buat rangking (opsional).")
+
+if "selected_indicators" not in st.session_state:
+    st.session_state.selected_indicators = list(AVAILABLE_INDICATORS.keys())
+
+col_a, col_b = st.sidebar.columns(2)
+if col_a.button("Pilih Semua", width='stretch'):
+    st.session_state.selected_indicators = list(AVAILABLE_INDICATORS.keys())
+    for k in AVAILABLE_INDICATORS.keys():
+        st.session_state[f"chk_{k}"] = True
+if col_b.button("Kosongkan", width='stretch'):
+    st.session_state.selected_indicators = []
+    for k in AVAILABLE_INDICATORS.keys():
+        st.session_state[f"chk_{k}"] = False
+
+selected_indicators = []
+for key, label in AVAILABLE_INDICATORS.items():
+    related_screeners = INDICATOR_TO_SCREENERS.get(key, [])
+    help_text = None
+    if related_screeners:
+        related_labels = ", ".join(SCREENER_INFO[s]["label"] for s in related_screeners)
+        help_text = f"Terkait sama screener: {related_labels} - nyentang ini otomatis ikut nyentang screener itu juga."
+    checked = st.sidebar.checkbox(
+        label,
+        value=(key in st.session_state.selected_indicators),
+        key=f"chk_{key}",
+        help=help_text,
+        on_change=sync_screener_from_indicator, args=(key,),
+    )
+    if checked:
+        selected_indicators.append(key)
+st.session_state.selected_indicators = selected_indicators
+
+include_news = st.sidebar.checkbox(
+    "📰 Sertakan Sentimen Berita (penguat fundamental)",
+    value=True,
+    help="Cek berita terkini (maks 31 hari) soal emiten. Pakai analisis AI kalau API "
+         "key sudah diisi di stock_screener.py, kalau belum fallback ke keyword matching. "
+         "Link berita selalu disertakan buat verifikasi manual.",
+)
+
+include_macro = st.sidebar.checkbox(
+    "🌍 Cek Konteks Makro (Dow/Nikkei/KOSPI/VIX)",
+    value=True,
+    help="Cek kondisi bursa global (Video 29) sebelum screening - malam bursa Amerika, "
+         "pagi Nikkei & KOSPI. Cuma dicek sekali per klik screening, bukan per saham.",
+)
+
+goapi_configured = "ISI_" not in GOAPI_API_KEY and bool(GOAPI_API_KEY)
+include_bandarmology = st.sidebar.checkbox(
+    "📡 Sertakan Broker Summary (GoAPI) ⚠️",
+    value=False,
+    disabled=not goapi_configured,
+    help="Data broker net-buy/sell REAL dari GoAPI.IO. DEFAULT OFF karena "
+         "manggil API per saham - kuota bisa cepat habis kalau watchlist "
+         "banyak. " + ("Isi GOAPI_API_KEY di stock_screener.py dulu buat pakai ini."
+                        if not goapi_configured else "API key terdeteksi, siap dipakai."),
+)
+if include_bandarmology and not goapi_configured:
+    st.sidebar.warning("GOAPI_API_KEY belum diisi di stock_screener.py - fitur ini nggak akan jalan.")
+
+run_button = st.sidebar.button("🔍 Jalankan Screening", type="primary", width='stretch')
+
+# =========================================================================
+# AREA UTAMA - HASIL SCREENING
+# =========================================================================
+
+if "results" not in st.session_state:
+    st.session_state.results = None
+    st.session_state.last_run = None
+    st.session_state.evidence_map = {}
+    st.session_state.chart_data = {}
+    st.session_state.trade_levels_map = {}
+    st.session_state.macro_context = None
+
+if run_button:
+    if not active_screeners:
+        st.sidebar.error("Pilih minimal 1 screener dulu.")
+        st.stop()
+
+    if include_macro:
+        with st.spinner("Mengecek konteks makro (bursa global)..."):
+            st.session_state.macro_context = fetch_macro_context()
+    else:
+        st.session_state.macro_context = None
+
+    if scan_all:
+        with st.spinner("Mengambil daftar semua saham IDX..."):
+            watchlist = fetch_all_idx_tickers()
+        if not watchlist:
+            st.error("Gagal mengambil daftar saham IDX. Cek koneksi internet, atau coba lagi nanti.")
+            st.stop()
+    else:
+        watchlist = DEFAULT_WATCHLIST
+
+    results = []
+    evidence_map = {}
+    chart_data = {}
+    trade_levels_map = {}
+    progress_bar = st.progress(0, text="Memulai screening (mode batch)...")
+
+    batch_size = 50
+    total_batches = (len(watchlist) + batch_size - 1) // batch_size
+
+    for b in range(total_batches):
+        batch = watchlist[b * batch_size: (b + 1) * batch_size]
+        progress_bar.progress(
+            (b + 1) / total_batches,
+            text=f"Memproses batch {b + 1}/{total_batches} ({len(batch)} saham)...",
+        )
+        batch_data = fetch_batch_data(batch)
+
+        for ticker, df in batch_data.items():
+            screeners = compute_screener_results(df)
+
+            passed_any = any(screeners[s]["passed"] for s in active_screeners if s in screeners)
+            if not passed_any:
+                continue
+
+            tech = compute_signals(df, selected_indicators=selected_indicators)
+            all_reasons = list(tech["reasons"])
+            total_score = tech["score"]
+
+            news_url = None
+            if include_news:
+                fund = compute_fundamental_score(ticker)
+                total_score += fund["score"]
+                all_reasons += fund["reasons"]
+                news_url = fund.get("search_url")
+
+            if include_bandarmology and goapi_configured:
+                bandar = compute_bandarmology_score(ticker, df)
+                total_score += bandar["score"]
+                all_reasons += bandar["reasons"]
+
+            lolos_tags = []
+            for s in active_screeners:
+                if screeners.get(s, {}).get("passed"):
+                    lolos_tags.append(SCREENER_INFO[s]["label"].split(" ", 1)[1])
+
+            evidence_map[ticker] = {s: screeners[s]["evidence"] for s in active_screeners if s in screeners}
+            chart_data[ticker] = df
+            try:
+                trade_levels_map[ticker] = compute_trade_levels(df)
+            except Exception:
+                trade_levels_map[ticker] = None
+
+            results.append({
+                "Ticker": ticker,
+                "Harga": tech["price"],
+                "Skor": total_score,
+                "RSI": round(tech["rsi"], 1),
+                "Lolos Screener": ", ".join(lolos_tags) if lolos_tags else "-",
+                "Alasan": ", ".join(all_reasons) if all_reasons else "-",
+                "Link Berita": news_url or "",
+            })
+
+    progress_bar.empty()
+    st.session_state.results = pd.DataFrame(results)
+    st.session_state.evidence_map = evidence_map
+    st.session_state.chart_data = chart_data
+    st.session_state.trade_levels_map = trade_levels_map
+    st.session_state.last_run = datetime.now().strftime("%d %b %Y, %H:%M:%S")
+
+if st.session_state.results is not None:
+    st.caption(f"Terakhir dijalankan: {st.session_state.last_run}")
+
+    if st.session_state.macro_context:
+        mc = st.session_state.macro_context
+        icon = {1: "🟢", -1: "🔴", 0: "🟡"}[mc["sentiment_score"]]
+        with st.expander(f"{icon} Konteks Makro: {mc['summary']}", expanded=False):
+            if mc["indices"]:
+                mc_cols = st.columns(len(mc["indices"]))
+                for i, (sym, data) in enumerate(mc["indices"].items()):
+                    mc_cols[i].metric(data["name"], f"{data['pct_change']:+.2f}%")
+            else:
+                st.caption("Data makro tidak tersedia saat ini.")
+            st.caption(
+                "Malam: bursa Amerika (Dow/S&P/Nasdaq/VIX). Pagi: Nikkei & KOSPI "
+                "(buka ~2 jam lebih awal, dianggap lebih relate ke IHSG karena "
+                "sama-sama regional Asia)."
+            )
+
+    df_results = st.session_state.results
+    evidence_map = st.session_state.evidence_map
+
+    col1, col2, col3 = st.columns(3)
+    col1.metric("Saham lolos screener", len(df_results))
+    col2.metric("Skor tertinggi", int(df_results["Skor"].max()) if len(df_results) else 0)
+    col3.metric("Skor rata-rata", round(df_results["Skor"].mean(), 1) if len(df_results) else 0)
+
+    st.subheader("Kandidat Hasil Screening")
+    if len(df_results) > 0:
+        st.dataframe(
+            df_results.sort_values("Skor", ascending=False),
+            width='stretch',
+            hide_index=True,
+            column_config={
+                "Harga": st.column_config.NumberColumn(format="%d"),
+                "Link Berita": st.column_config.LinkColumn(
+                    "Cek Berita Manual", display_text="🔗 Buka"
+                ),
+            },
+        )
+
+        st.markdown("---")
+        st.subheader("🔍 Bukti Validitas per Saham")
+        st.caption(
+            "Pilih saham, lalu klik salah satu kriteria indikator di bawah — grafiknya "
+            "otomatis kasih penanda dan deskripsi kriteria itu muncul di bawahnya."
+        )
+
+        pilihan_ticker = st.selectbox("Pilih saham:", df_results["Ticker"].tolist())
+
+        # Leading-Lagging: kalau ticker ini masuk grup konglomerat, cek status-nya
+        ticker_group = None
+        for gname, members in KONGLOMERAT_GROUPS.items():
+            if pilihan_ticker in members:
+                ticker_group = (gname, members)
+                break
+        if ticker_group:
+            gname, members = ticker_group
+            with st.spinner(f"Cek status leading-lagging grup '{gname}'..."):
+                # pakai data yang udah ke-fetch kalau ada, kalau nggak fetch on-demand
+                group_batch = {t: st.session_state.chart_data[t]
+                                for t in members if t in st.session_state.chart_data}
+                missing = [t for t in members if t not in group_batch]
+                if missing:
+                    group_batch.update(fetch_batch_data(missing))
+            ll = check_leading_lagging(pilihan_ticker, group_batch)
+            if ll["triggered"]:
+                st.info(f"🔗 **Leading-Lagging**: {ll['value']}")
+            else:
+                st.caption(f"🔗 Leading-Lagging: {ll['value']}")
+
+        criteria_options = ["(Nggak ada yang dipilih - tampilan grafik biasa)"]
+        criteria_lookup = {}
+        if pilihan_ticker in evidence_map:
+            for screener_key, evidence_list in evidence_map[pilihan_ticker].items():
+                screener_label = SCREENER_INFO[screener_key]["label"]
+                for item in evidence_list:
+                    status_icon = "✅" if item["passed"] else "❌"
+                    display = f"{status_icon} [{screener_label}] {item['label']}"
+                    criteria_options.append(display)
+                    criteria_lookup[display] = item
+
+        pilihan_kriteria = st.selectbox("Klik untuk pilih indikator/kriteria:", criteria_options)
+
+        trade_levels = st.session_state.trade_levels_map.get(pilihan_ticker)
+        highlight_label = None
+        if pilihan_kriteria in criteria_lookup:
+            highlight_label = criteria_lookup[pilihan_kriteria]["label"]
+
+        if pilihan_ticker and pilihan_ticker in st.session_state.chart_data:
+            st.plotly_chart(
+                build_evidence_chart(
+                    st.session_state.chart_data[pilihan_ticker], pilihan_ticker,
+                    trade_levels=trade_levels, highlight_label=highlight_label,
+                ),
+                width='stretch',
+            )
+
+        if pilihan_kriteria in criteria_lookup:
+            item = criteria_lookup[pilihan_kriteria]
+            desc = item.get("description") or "Belum ada deskripsi buat kriteria ini."
+            status_text = "✅ **LOLOS**" if item["passed"] else "❌ **TIDAK LOLOS**"
+            st.info(f"**{item['label']}** — {status_text}\n\n"
+                    f"📝 {desc}\n\n"
+                    f"📊 Nilai aktual: `{item['value']}`")
+
+        if trade_levels:
+            st.markdown("#### 🎯 Level Trading (perkiraan, bukan jaminan)")
+            lc1, lc2, lc3, lc4 = st.columns(4)
+            lc1.metric("Support", f"{trade_levels['support']:,.0f}")
+            lc2.metric("Stop Loss", f"{trade_levels['stop_loss']:,.0f}",
+                       delta=f"{(trade_levels['stop_loss']/trade_levels['price']-1)*100:.1f}%",
+                       delta_color="inverse")
+            lc3.metric("Take Profit 1", f"{trade_levels['take_profit_1']:,.0f}",
+                       delta=f"{(trade_levels['take_profit_1']/trade_levels['price']-1)*100:.1f}%")
+            lc4.metric("Take Profit 2", f"{trade_levels['take_profit_2']:,.0f}",
+                       delta=f"{(trade_levels['take_profit_2']/trade_levels['price']-1)*100:.1f}%")
+            if trade_levels.get("risk_reward_1"):
+                st.caption(
+                    f"Risk:Reward ke TP1 ≈ 1:{trade_levels['risk_reward_1']}, "
+                    f"ke TP2 ≈ 1:{trade_levels['risk_reward_2']}. Support/resistance "
+                    f"dihitung dari data historis - selalu cek ulang manual sebelum entry."
+                )
+
+        st.markdown("---")
+        if pilihan_ticker and pilihan_ticker in evidence_map:
+            for screener_key, evidence_list in evidence_map[pilihan_ticker].items():
+                screener_label = SCREENER_INFO[screener_key]["label"]
+                with st.expander(f"{screener_label} — semua kriteria", expanded=False):
+                    if not evidence_list:
+                        st.caption("Tidak ada data (kemungkinan data historis kurang).")
+                        continue
+                    ev_df = pd.DataFrame(evidence_list)[["label", "passed", "value"]]
+                    ev_df["passed"] = ev_df["passed"].map({True: "✅ Lolos", False: "❌ Tidak"})
+                    ev_df = ev_df.rename(columns={
+                        "label": "Kriteria", "passed": "Status", "value": "Nilai Aktual",
+                    })
+                    st.dataframe(ev_df, width='stretch', hide_index=True)
+    else:
+        st.info("Nggak ada saham yang lolos screener yang dipilih. Coba ganti pilihan screener di sidebar.")
+else:
+    st.info("👈 Pilih screener & klik tombol **'Jalankan Screening'** di sidebar kiri untuk mulai.")
+
+
+# =========================================================================
+# SCREENING SATU SAHAM (cek cepat, nggak perlu scan semua watchlist dulu)
+# =========================================================================
+
+st.markdown("---")
+st.markdown("---")
+st.header("🔎 Screening Satu Saham")
+st.caption("Cek satu saham langsung tanpa nunggu scan semua watchlist selesai dulu.")
+
+col_input, col_button = st.columns([3, 1])
+single_ticker_input = col_input.text_input(
+    "Kode saham (contoh: BBCA, TLKM, GOTO):", value="", key="single_ticker_input",
+    placeholder="Ketik kode saham tanpa .JK",
+).strip()
+single_cek_button = col_button.button("🔎 Cek Saham Ini", type="primary", width='stretch')
+
+if "single_result" not in st.session_state:
+    st.session_state.single_result = None
+    st.session_state.single_df = None
+    st.session_state.single_trade_levels = None
+
+if single_cek_button and single_ticker_input:
+    ticker_full = single_ticker_input.upper()
+    if not ticker_full.endswith(".JK"):
+        ticker_full += ".JK"
+
+    with st.spinner(f"Menganalisis {ticker_full}..."):
+        df_single = fetch_data(ticker_full)
+
+        if df_single.empty:
+            st.session_state.single_result = {"found": False, "ticker": ticker_full}
+        else:
+            screeners_single = compute_screener_results(df_single)
+            tech_single = compute_signals(df_single)
+            trade_levels_single = compute_trade_levels(df_single)
+
+            fund_single = None
+            if include_news:
+                fund_single = compute_fundamental_score(ticker_full)
+
+            bandar_single = None
+            if include_bandarmology and goapi_configured:
+                bandar_single = compute_bandarmology_score(ticker_full, df_single, include_buy_the_dip=True)
+
+            ll_single = None
+            for gname, members in KONGLOMERAT_GROUPS.items():
+                if ticker_full in members:
+                    group_batch_single = fetch_batch_data(members)
+                    ll_single = check_leading_lagging(ticker_full, group_batch_single)
+                    break
+
+            st.session_state.single_result = {
+                "found": True,
+                "ticker": ticker_full,
+                "screeners": screeners_single,
+                "tech": tech_single,
+                "fund": fund_single,
+                "bandar": bandar_single,
+                "leading_lagging": ll_single,
+            }
+            st.session_state.single_df = df_single
+            st.session_state.single_trade_levels = trade_levels_single
+
+single_result = st.session_state.single_result
+
+if single_result is None:
+    st.caption("👆 Ketik kode saham dan klik tombol buat mulai analisis.")
+elif not single_result.get("found"):
+    st.error(f"❌ Data untuk {single_result['ticker']} tidak ditemukan (kode salah, atau saham kurang dari 30 hari transaksi).")
+else:
+    ticker = single_result["ticker"]
+    tech = single_result["tech"]
+    df_single = st.session_state.single_df
+    trade_levels_single = st.session_state.single_trade_levels
+
+    st.success(f"**{ticker}** — Harga sekarang: **{tech['price']:,.0f}** | RSI: **{tech['rsi']:.1f}**")
+
+    # Status di semua screener
+    scr_cols = st.columns(len(SCREENER_INFO))
+    for i, (skey, sinfo) in enumerate(SCREENER_INFO.items()):
+        passed = single_result["screeners"].get(skey, {}).get("passed", False)
+        scr_cols[i].metric(sinfo["label"], "✅ Lolos" if passed else "❌ Tidak")
+
+    if single_result.get("leading_lagging"):
+        ll = single_result["leading_lagging"]
+        if ll["triggered"]:
+            st.info(f"🔗 **Leading-Lagging**: {ll['value']}")
+        else:
+            st.caption(f"🔗 Leading-Lagging: {ll['value']}")
+
+    if single_result.get("fund") and single_result["fund"]["reasons"]:
+        st.info(f"📰 **Berita**: {single_result['fund']['reasons'][0]}")
+        if single_result["fund"].get("search_url"):
+            st.caption(f"[🔗 Cek semua berita terkait]({single_result['fund']['search_url']})")
+
+    if single_result.get("bandar") and single_result["bandar"].get("available"):
+        bandar = single_result["bandar"]
+        if bandar["reasons"]:
+            for r in bandar["reasons"]:
+                st.info(f"📡 **Broker Summary**: {r}")
+        else:
+            st.caption("📡 Broker Summary: nggak ada sinyal akumulasi smart money hari ini.")
+
+    st.markdown("#### Semua Kriteria per Screener")
+    for screener_key, sdata in single_result["screeners"].items():
+        screener_label = SCREENER_INFO.get(screener_key, {}).get("label", screener_key)
+        with st.expander(f"{screener_label} — {'✅ Lolos' if sdata['passed'] else '❌ Tidak lolos'}", expanded=False):
+            if not sdata["evidence"]:
+                st.caption("Tidak ada data.")
+                continue
+            ev_df = pd.DataFrame(sdata["evidence"])[["label", "passed", "value"]]
+            ev_df["passed"] = ev_df["passed"].map({True: "✅ Lolos", False: "❌ Tidak"})
+            ev_df = ev_df.rename(columns={"label": "Kriteria", "passed": "Status", "value": "Nilai Aktual"})
+            st.dataframe(ev_df, width='stretch', hide_index=True)
+
+    st.plotly_chart(
+        build_evidence_chart(df_single, ticker, trade_levels=trade_levels_single),
+        width='stretch',
+    )
+
+    st.markdown("#### 🎯 Level Trading (perkiraan, bukan jaminan)")
+    lc1, lc2, lc3, lc4 = st.columns(4)
+    lc1.metric("Support", f"{trade_levels_single['support']:,.0f}")
+    lc2.metric("Stop Loss", f"{trade_levels_single['stop_loss']:,.0f}",
+               delta=f"{(trade_levels_single['stop_loss']/trade_levels_single['price']-1)*100:.1f}%",
+               delta_color="inverse")
+    lc3.metric("Take Profit 1", f"{trade_levels_single['take_profit_1']:,.0f}",
+               delta=f"{(trade_levels_single['take_profit_1']/trade_levels_single['price']-1)*100:.1f}%")
+    lc4.metric("Take Profit 2", f"{trade_levels_single['take_profit_2']:,.0f}",
+               delta=f"{(trade_levels_single['take_profit_2']/trade_levels_single['price']-1)*100:.1f}%")
+
+
+# =========================================================================
+# CATATAN BUAT KAMU (baca ini)
+# =========================================================================
+#
+# CARA JALANIN:
+#   streamlit run web_app.py   (BUKAN "python web_app.py")
+#
+# CARA BERHENTIKAN:
+#   Ctrl+C di Command Prompt yang lagi jalanin server
+#
+# SOAL WATCHLIST:
+#   Selalu pakai daftar bawaan (LQ45 + konglomerat) kecuali centang
+#   "Scan SEMUA saham IDX". Buat ubah daftar bawaan, edit LQ45_LIST
+#   atau KONGLOMERAT_GROUPS di stock_screener.py.
