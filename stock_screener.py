@@ -1257,7 +1257,7 @@ def compute_sentiment_score(ticker: str) -> dict:
 
 # Isi API key GoAPI kamu di sini (JANGAN taruh di kode yang di-push ke
 # GitHub public - pakai environment variable / Streamlit Secrets).
-GOAPI_API_KEY = "7d17369f-0eff-5e4f-9440-c5c28b92"
+GOAPI_API_KEY = "ISI_API_KEY_GOAPI_KAMU"
 GOAPI_BASE_URL = "https://api.goapi.io/stock/idx"
 
 # Referensi klasifikasi broker (dari riset manual, bisa berubah - cek ulang berkala)
@@ -1357,6 +1357,7 @@ def check_broker_accumulation(symbol: str, date: str = None) -> dict:
             "date": date,
             "description": BROKER_SUMMARY_DESCRIPTION,
             "raw_table": [],
+            "evidence": [],
         }
 
     broker_net = {}
@@ -1379,6 +1380,7 @@ def check_broker_accumulation(symbol: str, date: str = None) -> dict:
             "date": date,
             "description": BROKER_SUMMARY_DESCRIPTION,
             "raw_table": [],
+            "evidence": [],
         }
 
     sorted_brokers = sorted(broker_net.items(), key=lambda x: x[1], reverse=True)
@@ -1402,13 +1404,17 @@ def check_broker_accumulation(symbol: str, date: str = None) -> dict:
     # Bukti langsung per broker (raw_table) - ini yang ditampilkan sebagai
     # tabel di web app, bukan cuma disimpulkan lewat teks.
     raw_table = []
+    total_smart_net = 0.0
+    total_retail_net = 0.0
     for code, net_val in sorted_brokers:
         if code in BROKER_SMART_MONEY:
             kategori = "🟢 Smart Money"
             nama = BROKER_SMART_MONEY[code]
+            total_smart_net += net_val
         elif code in BROKER_RETAIL:
             kategori = "🔵 Retail"
             nama = BROKER_RETAIL[code]
+            total_retail_net += net_val
         else:
             kategori = "-"
             nama = BROKER_INSIDER_MAP.get(code, "-")
@@ -1420,6 +1426,63 @@ def check_broker_accumulation(symbol: str, date: str = None) -> dict:
             "Sisi": "Net Buy" if net_val > 0 else ("Net Sell" if net_val < 0 else "Netral"),
         })
 
+    total_all_net = sum(v for _, v in sorted_brokers)
+    n_buy_side = sum(1 for _, v in sorted_brokers if v > 0)
+    n_sell_side = sum(1 for _, v in sorted_brokers if v < 0)
+
+    # Evidence berbentuk POIN/TABEL (sama polanya kayak screener BSJP/BPJS/Day
+    # Trade) - biar hasil bandarmology bisa divalidasi kriteria per kriteria,
+    # bukan cuma dibaca dari 1 kalimat kesimpulan.
+    evidence = [
+        {
+            "key": "bandar_top_buyer",
+            "label": "Net-Buy Terbesar Hari Ini",
+            "passed": bool(top_buyer_val > 0),
+            "value": f"{top_buyer_code} ({smart_name}) — Rp{top_buyer_val:,.0f}",
+            "description": "Broker dengan selisih beli-jual (net) TERBESAR hari itu. Ini "
+                            "'pemain utama' yang paling banyak nambah posisi net di saham ini.",
+        },
+        {
+            "key": "bandar_top_buyer_category",
+            "label": "Kategori Net-Buyer Terbesar",
+            "passed": is_smart_money_buying,
+            "value": ("🟢 Smart Money" if is_smart_money_buying else
+                      ("🔵 Retail" if top_buyer_code in BROKER_RETAIL else "❓ Belum diklasifikasi")) + insider_note,
+            "description": "LOLOS kalau net-buyer terbesar termasuk broker 'smart money' "
+                            "(institusi/asing besar, lihat tabel referensi di bawah) - "
+                            "dianggap sinyal akumulasi yang lebih meyakinkan dibanding kalau "
+                            "yang beli cuma broker retail.",
+        },
+        {
+            "key": "bandar_top_seller",
+            "label": "Net-Sell Terbesar Hari Ini",
+            "passed": is_retail_selling,
+            "value": f"{top_seller_code} — Rp{abs(top_seller_val):,.0f}"
+                      + (" (Retail)" if is_retail_selling else ""),
+            "description": "Broker dengan net-sell (jual bersih) terbesar. Kalau ini broker "
+                            "RETAIL sementara net-buyer terbesar adalah smart money, polanya "
+                            "sering diartikan 'retail panic-sell, institusi akumulasi'.",
+        },
+        {
+            "key": "bandar_breadth",
+            "label": "Sebaran Broker (Buy vs Sell)",
+            "passed": bool(n_buy_side >= n_sell_side),
+            "value": f"{n_buy_side} broker net-buy vs {n_sell_side} broker net-sell (dari {len(sorted_brokers)} broker aktif)",
+            "description": "Berapa banyak broker yang net-buy vs net-sell hari itu. Kalau "
+                            "mayoritas broker net-buy, minat beli tersebar luas (bukan cuma "
+                            "1-2 broker), biasanya lebih sehat.",
+        },
+        {
+            "key": "bandar_net_total",
+            "label": "Net Value Total Semua Broker",
+            "passed": bool(total_all_net > 0),
+            "value": f"Rp{total_all_net:,.0f}",
+            "description": "Total net-buy dikurangi net-sell semua broker digabung. Positif "
+                            "artinya hari itu lebih banyak aksi beli ketimbang jual secara "
+                            "keseluruhan (across semua broker, bukan cuma yang terbesar).",
+        },
+    ]
+
     return {
         "triggered": triggered,
         "value": detail,
@@ -1430,7 +1493,20 @@ def check_broker_accumulation(symbol: str, date: str = None) -> dict:
         "is_smart_money_buying": is_smart_money_buying,
         "is_retail_selling": is_retail_selling,
         "raw_table": raw_table,
+        "evidence": evidence,
+        "total_smart_net": round(total_smart_net, 0),
+        "total_retail_net": round(total_retail_net, 0),
     }
+
+
+BUY_THE_DIP_DESCRIPTION = (
+    "Cek apakah dalam beberapa hari terakhir ada broker smart money net-buy "
+    "BESAR justru pas harga saham lagi turun tajam (>=1% dalam sehari). Pola "
+    "ini sering diartikan sebagai 'buy the dip' institusi - mereka manfaatin "
+    "harga turun buat masuk lebih murah, bukan ikut panic-sell. INGAT: fungsi "
+    "ini manggil API GoAPI beberapa kali sekaligus (1x per hari yang turun), "
+    "jadi lebih boros kuota - makanya cuma tersedia di mode Screening Satu Saham."
+)
 
 
 def check_buy_the_dip_accumulation(df: pd.DataFrame, symbol: str, lookback_days: int = 5) -> dict:
@@ -1443,12 +1519,13 @@ def check_buy_the_dip_accumulation(df: pd.DataFrame, symbol: str, lookback_days:
     (satu per hari yang harganya turun) - lumayan boros kuota GoAPI.
     """
     if len(df) < 2:
-        return {"triggered": False, "value": "Data harga kurang"}
+        return {"triggered": False, "value": "Data harga kurang", "description": BUY_THE_DIP_DESCRIPTION, "evidence": []}
 
     recent = df.tail(lookback_days)
     close = df["Close"]
 
     accumulation_during_dip = []
+    checked_days = []
     for date in recent.index:
         idx = df.index.get_loc(date)
         if idx == 0:
@@ -1458,6 +1535,12 @@ def check_buy_the_dip_accumulation(df: pd.DataFrame, symbol: str, lookback_days:
             continue
         date_str = date.strftime("%Y-%m-%d")
         acc = check_broker_accumulation(symbol, date_str)
+        checked_days.append({
+            "Tanggal": date_str,
+            "Perubahan Harga": f"{pct_change:+.1f}%",
+            "Net-Buyer Terbesar": acc.get("top_buyer", "-"),
+            "Smart Money Akumulasi?": "✅ Ya" if acc.get("is_smart_money_buying") else "❌ Tidak",
+        })
         if acc.get("is_smart_money_buying"):
             accumulation_during_dip.append((date_str, pct_change, acc["top_buyer"]))
 
@@ -1468,7 +1551,12 @@ def check_buy_the_dip_accumulation(df: pd.DataFrame, symbol: str, lookback_days:
     else:
         detail = "Nggak ada tanda akumulasi smart money pas harga turun dalam beberapa hari terakhir"
 
-    return {"triggered": triggered, "value": detail}
+    return {
+        "triggered": triggered,
+        "value": detail,
+        "description": BUY_THE_DIP_DESCRIPTION,
+        "evidence": checked_days,
+    }
 
 
 def compute_bandarmology_score(ticker: str, df: pd.DataFrame, include_buy_the_dip: bool = False) -> dict:
