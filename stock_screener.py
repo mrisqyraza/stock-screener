@@ -1257,7 +1257,7 @@ def compute_sentiment_score(ticker: str) -> dict:
 
 # Isi API key GoAPI kamu di sini (JANGAN taruh di kode yang di-push ke
 # GitHub public - pakai environment variable / Streamlit Secrets).
-GOAPI_API_KEY = "ISI_API_KEY_GOAPI_KAMU"
+GOAPI_API_KEY = "7d17369f-0eff-5e4f-9440-c5c28b92"
 GOAPI_BASE_URL = "https://api.goapi.io/stock/idx"
 
 # Referensi klasifikasi broker (dari riset manual, bisa berubah - cek ulang berkala)
