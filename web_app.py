@@ -40,6 +40,9 @@ from stock_screener import (
     KONGLOMERAT_GROUPS,
     INDICATOR_DESCRIPTIONS,
     BROKER_SUMMARY_DESCRIPTION,
+    BROKER_SMART_MONEY,
+    BROKER_RETAIL,
+    BROKER_INSIDER_MAP,
     WATCHLIST as DEFAULT_WATCHLIST,
 )
 
@@ -531,20 +534,17 @@ include_macro = st.sidebar.checkbox(
 )
 
 goapi_configured = "ISI_" not in GOAPI_API_KEY and bool(GOAPI_API_KEY)
-include_bandarmology = st.sidebar.checkbox(
-    "📡 Sertakan Broker Summary (GoAPI) ⚠️",
-    value=False,
-    disabled=not goapi_configured,
-    help="Data broker net-buy/sell REAL dari GoAPI.IO. DEFAULT OFF karena "
-         "manggil API per saham - kuota bisa cepat habis kalau watchlist "
-         "banyak. " + ("Isi GOAPI_API_KEY di stock_screener.py dulu buat pakai ini."
-                        if not goapi_configured else "API key terdeteksi, siap dipakai."),
+include_bandarmology = False  # Broker Summary (GoAPI) SENGAJA dimatikan buat mode Screening
+                               # Massal - biar kuota API nggak kepakai per-saham x puluhan
+                               # saham. Fitur ini cuma bisa diaktifkan di bagian
+                               # "🔎 Screening Satu Saham" di bawah, biar hasilnya per saham
+                               # bisa dijelaskan & divalidasi detail satu-satu.
+st.sidebar.caption(
+    "📡 Broker Summary (GoAPI) nggak tersedia di mode ini biar kuota API nggak boros "
+    "kalau nge-scan banyak saham sekaligus. Buka bagian **'🔎 Screening Satu Saham'** "
+    "di bawah kalau mau lihat data broker summary lengkap + validasinya per saham."
+    + ("" if goapi_configured else " (API key GoAPI juga belum diisi di stock_screener.py.)")
 )
-if include_bandarmology and not goapi_configured:
-    st.sidebar.warning("GOAPI_API_KEY belum diisi di stock_screener.py - fitur ini nggak akan jalan.")
-if include_bandarmology:
-    with st.sidebar.expander("ℹ️ Apa itu Broker Summary?", expanded=False):
-        st.caption(BROKER_SUMMARY_DESCRIPTION)
 
 run_button = st.sidebar.button("🔍 Jalankan Screening", type="primary", width='stretch')
 
@@ -558,7 +558,6 @@ if "results" not in st.session_state:
     st.session_state.evidence_map = {}
     st.session_state.chart_data = {}
     st.session_state.trade_levels_map = {}
-    st.session_state.bandar_map = {}
     st.session_state.macro_context = None
 
 if run_button:
@@ -585,7 +584,6 @@ if run_button:
     evidence_map = {}
     chart_data = {}
     trade_levels_map = {}
-    bandar_map = {}
     progress_bar = st.progress(0, text="Memulai screening (mode batch)...")
 
     batch_size = 50
@@ -617,11 +615,9 @@ if run_button:
                 all_reasons += fund["reasons"]
                 news_url = fund.get("search_url")
 
-            if include_bandarmology and goapi_configured:
-                bandar = compute_bandarmology_score(ticker, df)
-                total_score += bandar["score"]
-                all_reasons += bandar["reasons"]
-                bandar_map[ticker] = bandar
+            # Broker Summary (GoAPI) SENGAJA nggak dipanggil di sini (mode
+            # massal) - biar kuota API nggak kepakai per-saham x puluhan
+            # saham sekaligus. Fitur ini cuma jalan di "Screening Satu Saham".
 
             lolos_tags = []
             for s in active_screeners:
@@ -650,7 +646,6 @@ if run_button:
     st.session_state.evidence_map = evidence_map
     st.session_state.chart_data = chart_data
     st.session_state.trade_levels_map = trade_levels_map
-    st.session_state.bandar_map = bandar_map
     st.session_state.last_run = datetime.now().strftime("%d %b %Y, %H:%M:%S")
 
 if st.session_state.results is not None:
@@ -724,22 +719,12 @@ if st.session_state.results is not None:
             else:
                 st.caption(f"🔗 Leading-Lagging: {ll['value']}")
 
-        bandar_for_ticker = st.session_state.bandar_map.get(pilihan_ticker)
-        if bandar_for_ticker and bandar_for_ticker.get("available"):
-            acc = bandar_for_ticker.get("broker_accumulation") or {}
-            with st.expander("📡 Broker Summary (GoAPI) — penjelasan & bukti langsung", expanded=False):
-                st.caption(acc.get("description") or BROKER_SUMMARY_DESCRIPTION)
-                if bandar_for_ticker["reasons"]:
-                    for r in bandar_for_ticker["reasons"]:
-                        st.info(f"**Kesimpulan**: {r}")
-                else:
-                    st.caption("Nggak ada sinyal akumulasi smart money terdeteksi hari ini.")
-                raw_table = acc.get("raw_table") or []
-                if raw_table:
-                    st.markdown(f"**Data mentah broker summary ({acc.get('date', '-')}) — langsung dari GoAPI:**")
-                    st.dataframe(pd.DataFrame(raw_table), width='stretch', hide_index=True)
-                else:
-                    st.caption("Data mentah broker per kode nggak tersedia (cek kuota/koneksi GoAPI).")
+        if goapi_configured:
+            st.caption(
+                f"📡 Mau lihat data Broker Summary buat **{pilihan_ticker}**? Buka bagian "
+                "**'🔎 Screening Satu Saham'** di bawah, ketik kodenya di sana - broker "
+                "summary cuma jalan per-saham biar kuota GoAPI-nya hemat."
+            )
 
         criteria_options = ["(Nggak ada yang dipilih - tampilan grafik biasa)"]
         criteria_lookup = {}
@@ -830,6 +815,21 @@ single_ticker_input = col_input.text_input(
 ).strip()
 single_cek_button = col_button.button("🔎 Cek Saham Ini", type="primary", width='stretch')
 
+single_col_a, single_col_b = st.columns(2)
+include_bandarmology_single = single_col_a.checkbox(
+    "📡 Sertakan Broker Summary (GoAPI)", value=goapi_configured, disabled=not goapi_configured,
+    help="Data broker net-buy/sell REAL dari GoAPI.IO buat SATU saham ini aja (1 kali "
+         "panggilan API, aman buat kuota). " + ("Isi GOAPI_API_KEY di stock_screener.py dulu."
+         if not goapi_configured else "API key terdeteksi."),
+)
+include_buy_the_dip_single = single_col_b.checkbox(
+    "📉 Cek juga Buy-the-Dip (5 hari terakhir)", value=False, disabled=not include_bandarmology_single,
+    help="Cek apakah broker smart money akumulasi pas harga lagi turun tajam, dalam "
+         "5 hari terakhir. Manggil API lebih dari 1 kali (boros kuota) - makanya opsional.",
+)
+if not goapi_configured:
+    st.caption("⚠️ GOAPI_API_KEY belum diisi di stock_screener.py - Broker Summary nggak akan jalan.")
+
 if "single_result" not in st.session_state:
     st.session_state.single_result = None
     st.session_state.single_df = None
@@ -855,8 +855,10 @@ if single_cek_button and single_ticker_input:
                 fund_single = compute_fundamental_score(ticker_full)
 
             bandar_single = None
-            if include_bandarmology and goapi_configured:
-                bandar_single = compute_bandarmology_score(ticker_full, df_single, include_buy_the_dip=True)
+            if include_bandarmology_single and goapi_configured:
+                bandar_single = compute_bandarmology_score(
+                    ticker_full, df_single, include_buy_the_dip=include_buy_the_dip_single,
+                )
 
             ll_single = None
             for gname, members in KONGLOMERAT_GROUPS.items():
@@ -912,19 +914,89 @@ else:
     if single_result.get("bandar") and single_result["bandar"].get("available"):
         bandar = single_result["bandar"]
         acc = bandar.get("broker_accumulation") or {}
-        with st.expander("📡 Broker Summary (GoAPI) — penjelasan & bukti langsung", expanded=True):
+        dip = bandar.get("buy_the_dip")
+
+        st.markdown("### 📡 Broker Summary (GoAPI) — Detail & Validasi")
+
+        with st.expander("📖 Apa itu Broker Summary & cara membacanya?", expanded=True):
             st.caption(acc.get("description") or BROKER_SUMMARY_DESCRIPTION)
-            if bandar["reasons"]:
-                for r in bandar["reasons"]:
-                    st.info(f"**Kesimpulan**: {r}")
-            else:
-                st.caption("Nggak ada sinyal akumulasi smart money terdeteksi hari ini.")
-            raw_table = acc.get("raw_table") or []
-            if raw_table:
-                st.markdown(f"**Data mentah broker summary ({acc.get('date', '-')}) — langsung dari GoAPI:**")
-                st.dataframe(pd.DataFrame(raw_table), width='stretch', hide_index=True)
-            else:
-                st.caption("Data mentah broker per kode nggak tersedia (cek kuota/koneksi GoAPI).")
+            st.markdown(
+                "**Cara memvalidasi hasil di bawah ini:**\n"
+                "1. Cek tabel **'Data Mentah per Broker'** — ini rekap net-buy/sell "
+                "LANGSUNG dari GoAPI, belum diolah kesimpulannya. Verifikasi manual di sini.\n"
+                "2. Cek tabel **'Kriteria Bandarmology'** — tiap baris adalah satu kriteria "
+                "penilaian (mis. siapa net-buyer terbesar, kategorinya apa) dengan status "
+                "Lolos/Tidak, biar nggak cuma percaya kesimpulan mentah-mentah.\n"
+                "3. Cocokkan kode broker di tabel data mentah dengan **'Tabel Referensi "
+                "Klasifikasi Broker'** di bawah - biar tahu kenapa suatu broker dianggap "
+                "'Smart Money' atau 'Retail'.\n"
+                "4. Ingat: ini indikator KONTEKS tambahan, bukan sinyal beli/jual "
+                "berdiri sendiri - selalu gabungkan dengan analisis teknikal & fundamental."
+            )
+
+        if bandar["reasons"]:
+            for r in bandar["reasons"]:
+                st.info(f"**Kesimpulan**: {r}")
+        else:
+            st.caption("Nggak ada sinyal akumulasi smart money terdeteksi hari ini.")
+
+        evidence_bandar = acc.get("evidence") or []
+        if evidence_bandar:
+            st.markdown(f"**📋 Kriteria Bandarmology ({acc.get('date', '-')}):**")
+            ev_bandar_df = pd.DataFrame(evidence_bandar)[["label", "passed", "value"]]
+            ev_bandar_df["passed"] = ev_bandar_df["passed"].map({True: "✅ Lolos", False: "❌ Tidak"})
+            ev_bandar_df = ev_bandar_df.rename(columns={"label": "Kriteria", "passed": "Status", "value": "Nilai Aktual"})
+            st.dataframe(ev_bandar_df, width='stretch', hide_index=True)
+            pilihan_kriteria_bandar = st.selectbox(
+                "Klik kriteria buat lihat penjelasan lengkapnya:",
+                ["(Nggak ada yang dipilih)"] + [e["label"] for e in evidence_bandar],
+                key="bandar_kriteria_select",
+            )
+            for e in evidence_bandar:
+                if e["label"] == pilihan_kriteria_bandar:
+                    status_text = "✅ **LOLOS**" if e["passed"] else "❌ **TIDAK LOLOS**"
+                    st.info(f"**{e['label']}** — {status_text}\n\n📝 {e['description']}\n\n📊 Nilai aktual: `{e['value']}`")
+
+        raw_table = acc.get("raw_table") or []
+        if raw_table:
+            st.markdown(f"**🧾 Data Mentah per Broker ({acc.get('date', '-')}) — langsung dari GoAPI, belum diolah:**")
+            st.dataframe(pd.DataFrame(raw_table), width='stretch', hide_index=True)
+            n_smart = sum(1 for r in raw_table if "Smart Money" in r["Kategori"])
+            n_retail = sum(1 for r in raw_table if "Retail" in r["Kategori"])
+            bc1, bc2, bc3 = st.columns(3)
+            bc1.metric("Total Broker Aktif", len(raw_table))
+            bc2.metric("Net Smart Money (Rp)", f"{acc.get('total_smart_net', 0):,.0f}")
+            bc3.metric("Net Retail (Rp)", f"{acc.get('total_retail_net', 0):,.0f}")
+        else:
+            st.caption("Data mentah broker per kode nggak tersedia (cek kuota/koneksi GoAPI).")
+
+        with st.expander("📚 Tabel Referensi Klasifikasi Broker (buat validasi manual)", expanded=False):
+            st.caption(
+                "Referensi dari riset manual - dipakai buat nge-kategorikan tiap kode broker "
+                "di tabel data mentah di atas. Bisa berubah sewaktu-waktu, cek ulang berkala."
+            )
+            ref_rows = []
+            for code, name in BROKER_SMART_MONEY.items():
+                ref_rows.append({"Kode": code, "Nama Sekuritas": name, "Kategori": "🟢 Smart Money"})
+            for code, name in BROKER_RETAIL.items():
+                ref_rows.append({"Kode": code, "Nama Sekuritas": name, "Kategori": "🔵 Retail"})
+            for code, name in BROKER_INSIDER_MAP.items():
+                ref_rows.append({"Kode": code, "Nama Sekuritas": f"Terkait {name}", "Kategori": "🟡 Insider/Konglomerat"})
+            st.dataframe(pd.DataFrame(ref_rows), width='stretch', hide_index=True)
+
+        if dip:
+            with st.expander("📉 Buy-the-Dip Check (5 hari terakhir)", expanded=False):
+                st.caption(dip.get("description", ""))
+                status_text = "✅ **TERDETEKSI**" if dip["triggered"] else "❌ **Nggak terdeteksi**"
+                st.info(f"{status_text} — {dip['value']}")
+                dip_evidence = dip.get("evidence") or []
+                if dip_evidence:
+                    st.markdown("**Rincian per hari yang harganya turun:**")
+                    st.dataframe(pd.DataFrame(dip_evidence), width='stretch', hide_index=True)
+                else:
+                    st.caption("Nggak ada hari dengan penurunan harga ≥1% dalam 5 hari terakhir.")
+        elif include_bandarmology_single and not include_buy_the_dip_single:
+            st.caption("ℹ️ Centang 'Cek juga Buy-the-Dip' di atas kalau mau lihat analisis akumulasi saat harga turun.")
 
     st.markdown("#### Semua Kriteria per Screener")
     single_criteria_options = ["(Nggak ada yang dipilih - tampilan grafik biasa)"]
