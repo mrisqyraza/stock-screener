@@ -17,6 +17,7 @@ import pandas as pd
 import ta
 import base64
 import os
+import json
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 from datetime import datetime
@@ -132,6 +133,51 @@ KEY_BOX_MAP = {
     "dt_rsi":      {"row": 3, "candles": 3},
     "dt_value":    {"row": 2, "candles": 1},
 }
+
+
+# =========================================================================
+# RIWAYAT SCREENING HARIAN (biar kuota GoAPI hemat - broker summary yang
+# udah pernah diambil hari ini nggak ditarik ulang, kecuali dipaksa refresh)
+# =========================================================================
+HISTORY_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "screening_history.json")
+
+
+def _today_str() -> str:
+    return datetime.now().strftime("%Y-%m-%d")
+
+
+def _load_history() -> dict:
+    """
+    Baca riwayat screening hari ini. Kalau tanggal di file beda dari hari
+    ini, riwayat lama DIANGGAP KEHAPUS (dimulai kosong lagi) - jadi reset-nya
+    otomatis tiap ganti hari, tanpa perlu proses hapus manual.
+
+    CATATAN JUJUR: ini nyimpen ke file lokal di server. Kalau kamu hosting
+    di Streamlit Cloud versi gratis, container-nya bisa di-restart otomatis
+    kalau app sempat "tidur" karena nggak ada yang buka lama - kalau itu
+    kejadian, riwayat ikut ke-reset walau masih hari yang sama. Ini
+    keterbatasan hosting gratisan, bukan bug di kode.
+    """
+    if not os.path.exists(HISTORY_FILE):
+        return {"date": _today_str(), "tickers": {}}
+    try:
+        with open(HISTORY_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception:
+        return {"date": _today_str(), "tickers": {}}
+    if data.get("date") != _today_str():
+        return {"date": _today_str(), "tickers": {}}
+    data.setdefault("tickers", {})
+    return data
+
+
+def _save_history(data: dict):
+    try:
+        os.makedirs(os.path.dirname(HISTORY_FILE), exist_ok=True)
+        with open(HISTORY_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, default=str)
+    except Exception:
+        pass  # gagal simpan (mis. filesystem read-only) - jangan bikin app crash
 
 
 def build_evidence_chart(df: pd.DataFrame, ticker: str, trade_levels: dict = None, highlight_item: dict = None):
@@ -808,6 +854,8 @@ st.markdown("---")
 st.header("🔎 Screening Satu Saham")
 st.caption("Cek satu saham langsung tanpa nunggu scan semua watchlist selesai dulu.")
 
+_history = _load_history()
+
 col_input, col_button = st.columns([3, 1])
 single_ticker_input = col_input.text_input(
     "Kode saham (contoh: BBCA, TLKM, GOTO):", value="", key="single_ticker_input",
@@ -818,8 +866,9 @@ single_cek_button = col_button.button("🔎 Cek Saham Ini", type="primary", widt
 single_col_a, single_col_b = st.columns(2)
 include_bandarmology_single = single_col_a.checkbox(
     "📡 Sertakan Broker Summary (GoAPI)", value=goapi_configured, disabled=not goapi_configured,
-    help="Data broker net-buy/sell REAL dari GoAPI.IO buat SATU saham ini aja (1 kali "
-         "panggilan API, aman buat kuota). " + ("Isi GOAPI_API_KEY di stock_screener.py dulu."
+    help="Data broker net-buy/sell REAL dari GoAPI.IO buat SATU saham ini aja. Kalau "
+         "saham ini SUDAH pernah di-cek hari ini, datanya dipakai dari cache (nggak "
+         "manggil API lagi) biar kuota hemat. " + ("Isi GOAPI_API_KEY di stock_screener.py dulu."
          if not goapi_configured else "API key terdeteksi."),
 )
 include_buy_the_dip_single = single_col_b.checkbox(
@@ -829,6 +878,22 @@ include_buy_the_dip_single = single_col_b.checkbox(
 )
 if not goapi_configured:
     st.caption("⚠️ GOAPI_API_KEY belum diisi di stock_screener.py - Broker Summary nggak akan jalan.")
+
+_ticker_preview = single_ticker_input.upper() if single_ticker_input else None
+if _ticker_preview and not _ticker_preview.endswith(".JK"):
+    _ticker_preview += ".JK"
+_cached_entry_preview = _history["tickers"].get(_ticker_preview) if _ticker_preview else None
+force_refresh_bandar = False
+if _cached_entry_preview and _cached_entry_preview.get("bandar"):
+    st.caption(
+        f"📦 **{_ticker_preview}** udah pernah di-screening hari ini pukul "
+        f"**{_cached_entry_preview.get('bandar_fetched_at', '-')}** - broker summary bakal "
+        "dipakai dari cache (hemat kuota GoAPI), bukan manggil API lagi."
+    )
+    force_refresh_bandar = st.checkbox(
+        "🔄 Paksa ambil ulang data broker summary (abaikan cache hari ini)",
+        value=False, key="force_refresh_bandar",
+    )
 
 if "single_result" not in st.session_state:
     st.session_state.single_result = None
@@ -855,10 +920,25 @@ if single_cek_button and single_ticker_input:
                 fund_single = compute_fundamental_score(ticker_full)
 
             bandar_single = None
+            bandar_from_cache = False
+            history = _load_history()
+            cached_entry = history["tickers"].get(ticker_full)
+            cached_bandar = cached_entry.get("bandar") if cached_entry else None
+            # Cache dianggap valid buat request ini kalau: ada, dan (nggak minta
+            # buy-the-dip ATAU buy-the-dip-nya udah pernah kesimpan juga), dan
+            # user nggak nge-klik "paksa ambil ulang".
+            cache_ok = bool(
+                cached_bandar and not force_refresh_bandar
+                and (not include_buy_the_dip_single or cached_bandar.get("buy_the_dip"))
+            )
             if include_bandarmology_single and goapi_configured:
-                bandar_single = compute_bandarmology_score(
-                    ticker_full, df_single, include_buy_the_dip=include_buy_the_dip_single,
-                )
+                if cache_ok:
+                    bandar_single = cached_bandar
+                    bandar_from_cache = True
+                else:
+                    bandar_single = compute_bandarmology_score(
+                        ticker_full, df_single, include_buy_the_dip=include_buy_the_dip_single,
+                    )
 
             ll_single = None
             for gname, members in KONGLOMERAT_GROUPS.items():
@@ -874,10 +954,25 @@ if single_cek_button and single_ticker_input:
                 "tech": tech_single,
                 "fund": fund_single,
                 "bandar": bandar_single,
+                "bandar_from_cache": bandar_from_cache,
                 "leading_lagging": ll_single,
             }
             st.session_state.single_df = df_single
             st.session_state.single_trade_levels = trade_levels_single
+
+            # Simpan/perbarui riwayat hari ini (auto-reset besok, lihat _load_history).
+            now_str = datetime.now().strftime("%H:%M:%S")
+            entry = history["tickers"].setdefault(ticker_full, {})
+            entry["last_checked"] = now_str
+            entry["price"] = float(tech_single.get("price", 0) or 0)
+            entry["rsi"] = float(tech_single.get("rsi", 0) or 0)
+            entry["screeners_passed"] = [
+                SCREENER_INFO[k]["label"] for k, v in screeners_single.items() if v["passed"]
+            ]
+            if include_bandarmology_single and goapi_configured and not bandar_from_cache:
+                entry["bandar"] = bandar_single
+                entry["bandar_fetched_at"] = now_str
+            _save_history(history)
 
 single_result = st.session_state.single_result
 
@@ -917,6 +1012,8 @@ else:
         dip = bandar.get("buy_the_dip")
 
         st.markdown("### 📡 Broker Summary (GoAPI) — Detail & Validasi")
+        if single_result.get("bandar_from_cache"):
+            st.caption("📦 Data ini dari **cache hari ini** (saham ini sudah pernah di-screening sebelumnya hari ini), bukan panggilan API baru - hemat kuota GoAPI.")
 
         with st.expander("📖 Apa itu Broker Summary & cara membacanya?", expanded=True):
             st.caption(acc.get("description") or BROKER_SUMMARY_DESCRIPTION)
@@ -1045,6 +1142,34 @@ else:
                delta=f"{(trade_levels_single['take_profit_1']/trade_levels_single['price']-1)*100:.1f}%")
     lc4.metric("Take Profit 2", f"{trade_levels_single['take_profit_2']:,.0f}",
                delta=f"{(trade_levels_single['take_profit_2']/trade_levels_single['price']-1)*100:.1f}%")
+
+
+# --- Riwayat Screening Hari Ini (di luar blok if, biar selalu kelihatan) ---
+st.markdown("#### 📜 Riwayat Screening Hari Ini")
+_history_display = _load_history()
+_hist_tickers = _history_display.get("tickers", {})
+if _hist_tickers:
+    hist_rows = []
+    for tkr, e in _hist_tickers.items():
+        hist_rows.append({
+            "Ticker": tkr,
+            "Terakhir Dicek": e.get("last_checked", "-"),
+            "Harga": f"{e.get('price', 0):,.0f}" if e.get("price") else "-",
+            "RSI": f"{e.get('rsi', 0):.1f}" if e.get("rsi") else "-",
+            "Screener Lolos": ", ".join(e.get("screeners_passed", [])) or "-",
+            "Broker Summary": f"✅ Diambil {e.get('bandar_fetched_at', '')}" if e.get("bandar") else "❌ Belum",
+        })
+    st.dataframe(pd.DataFrame(hist_rows), width='stretch', hide_index=True)
+    st.caption(
+        f"Riwayat ini otomatis kehapus tiap ganti hari (tanggal server: {_history_display['date']}). "
+        "Broker Summary yang udah 'Diambil' nggak akan manggil API lagi kalau kamu cek ulang saham "
+        "yang sama hari ini, kecuali kamu centang 'Paksa ambil ulang'."
+    )
+    if st.button("🗑️ Hapus riwayat hari ini sekarang"):
+        _save_history({"date": _today_str(), "tickers": {}})
+        st.rerun()
+else:
+    st.caption("Belum ada saham yang di-screening hari ini.")
 
 
 # =========================================================================
