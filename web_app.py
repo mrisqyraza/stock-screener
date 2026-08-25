@@ -323,6 +323,18 @@ if _hero_b64:
     st.markdown(
         f"""
         <style>
+        @keyframes kbFadeUp {{
+            0%   {{ opacity: 0; transform: translateY(14px); }}
+            100% {{ opacity: 1; transform: translateY(0); }}
+        }}
+        @keyframes kbShimmer {{
+            0%   {{ background-position: -200% center; }}
+            100% {{ background-position: 200% center; }}
+        }}
+        @keyframes kbPulse {{
+            0%, 100% {{ box-shadow: 0 0 0 0 rgba(255,215,0,0.35); }}
+            50%      {{ box-shadow: 0 0 0 5px rgba(255,215,0,0); }}
+        }}
         .kb-hero {{
             position: relative;
             width: 100%;
@@ -331,18 +343,29 @@ if _hero_b64:
             background-image: url("data:image/jpeg;base64,{_hero_b64}");
             background-size: cover;
             background-position: center;
-            min-height: 260px;
+            min-height: 280px;
             display: flex;
             align-items: center;
-            padding: 0 2.2rem;
+            padding: 0 2.4rem;
             margin-bottom: 0.6rem;
             border-bottom: 4px solid #B8860B;
         }}
         .kb-hero-text {{
-            max-width: 640px;
+            max-width: 660px;
+            animation: kbFadeUp 0.9s ease-out;
+        }}
+        .kb-hero-eyebrow {{
+            display: inline-block;
+            color: #FFD700;
+            font-size: 0.78rem;
+            font-weight: 700;
+            letter-spacing: 2.5px;
+            text-transform: uppercase;
+            margin: 0 0 0.5rem 0;
+            opacity: 0.9;
         }}
         .kb-hero-title {{
-            font-size: 2.4rem;
+            font-size: 2.5rem;
             font-weight: 800;
             letter-spacing: 1px;
             background: linear-gradient(90deg, #B8860B, #FFD700, #FFF3B0, #FFD700, #B8860B);
@@ -350,21 +373,61 @@ if _hero_b64:
             -webkit-background-clip: text;
             -webkit-text-fill-color: transparent;
             background-clip: text;
-            margin: 0 0 0.35rem 0;
+            animation: kbShimmer 3s linear infinite;
+            margin: 0 0 0.5rem 0;
         }}
         .kb-hero-sub {{
             color: #f0f0f0;
-            font-size: 1.02rem;
-            margin: 0;
-            line-height: 1.5;
+            font-size: 1.03rem;
+            margin: 0 0 1rem 0;
+            line-height: 1.55;
+            max-width: 560px;
+        }}
+        .kb-badge-row {{
+            display: flex;
+            flex-wrap: wrap;
+            gap: 0.5rem;
+            margin-bottom: 0.9rem;
+        }}
+        .kb-badge {{
+            display: inline-flex;
+            align-items: center;
+            gap: 0.35rem;
+            background: rgba(255, 215, 0, 0.1);
+            border: 1px solid rgba(255, 215, 0, 0.55);
+            color: #FFE9A8;
+            font-size: 0.82rem;
+            font-weight: 600;
+            padding: 0.28rem 0.75rem;
+            border-radius: 999px;
+            backdrop-filter: blur(2px);
+        }}
+        .kb-hero-cta {{
+            display: inline-flex;
+            align-items: center;
+            gap: 0.4rem;
+            color: #FFD700;
+            font-size: 0.9rem;
+            font-weight: 700;
+            border: 1.5px solid #FFD700;
+            padding: 0.4rem 1rem;
+            border-radius: 8px;
+            animation: kbPulse 2.4s infinite;
         }}
         </style>
         <div class="kb-hero">
             <div class="kb-hero-text">
+                <p class="kb-hero-eyebrow">IDX Stock Intelligence Tool</p>
                 <p class="kb-hero-title">👑 KingBill Stock Screener</p>
-                <p class="kb-hero-sub">Instrumen screening saham IDX berbasis sinyal teknikal &amp;
-                broker summary real — dibangun buat mempercepat riset, bukan menggantikan
+                <p class="kb-hero-sub">Screening saham IDX otomatis pakai sinyal teknikal &amp;
+                data broker summary REAL — biar riset kamu lebih cepat, tanpa gantikan
                 keputusan trading kamu sendiri.</p>
+                <div class="kb-badge-row">
+                    <span class="kb-badge">🎯 3 Screener Siap Pakai</span>
+                    <span class="kb-badge">📡 Broker Summary Real-Time</span>
+                    <span class="kb-badge">📊 900+ Saham IDX</span>
+                </div>
+                <span class="kb-hero-cta">👇 Mulai screening di bawah</span>
             </div>
         </div>
         """,
