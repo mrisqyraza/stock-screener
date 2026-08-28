@@ -987,9 +987,10 @@ include_bandarmology_single = single_col_a.checkbox(
          if not goapi_configured else "API key terdeteksi."),
 )
 include_buy_the_dip_single = single_col_b.checkbox(
-    "📉 Cek juga Buy-the-Dip (5 hari terakhir)", value=False, disabled=not include_bandarmology_single,
+    "📉 Cek juga Buy-the-Dip (30 hari terakhir)", value=False, disabled=not include_bandarmology_single,
     help="Cek apakah broker smart money akumulasi pas harga lagi turun tajam, dalam "
-         "5 hari terakhir. Manggil API lebih dari 1 kali (boros kuota) - makanya opsional.",
+         "30 hari terakhir. Manggil API sekali per hari yang harganya turun (bisa "
+         "belasan kali, cukup boros kuota) - makanya opsional dan disarankan sesekali aja.",
 )
 if not goapi_configured:
     st.caption("⚠️ GOAPI_API_KEY belum diisi di stock_screener.py - Broker Summary nggak akan jalan.")
@@ -1201,7 +1202,7 @@ else:
             st.dataframe(pd.DataFrame(ref_rows), width='stretch', hide_index=True)
 
         if dip:
-            with st.expander("📉 Buy-the-Dip Check (5 hari terakhir)", expanded=False):
+            with st.expander("📉 Buy-the-Dip Check (30 hari terakhir)", expanded=False):
                 st.caption(dip.get("description", ""))
                 status_text = "✅ **TERDETEKSI**" if dip["triggered"] else "❌ **Nggak terdeteksi**"
                 st.info(f"{status_text} — {dip['value']}")
@@ -1210,7 +1211,7 @@ else:
                     st.markdown("**Rincian per hari yang harganya turun:**")
                     st.dataframe(pd.DataFrame(dip_evidence), width='stretch', hide_index=True)
                 else:
-                    st.caption("Nggak ada hari dengan penurunan harga ≥1% dalam 5 hari terakhir.")
+                    st.caption("Nggak ada hari dengan penurunan harga ≥1% dalam 30 hari terakhir.")
         elif include_bandarmology_single and not include_buy_the_dip_single:
             st.caption("ℹ️ Centang 'Cek juga Buy-the-Dip' di atas kalau mau lihat analisis akumulasi saat harga turun.")
 
