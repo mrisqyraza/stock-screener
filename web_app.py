@@ -18,6 +18,7 @@ import ta
 import base64
 import os
 import json
+import requests
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 from datetime import datetime
@@ -136,48 +137,124 @@ KEY_BOX_MAP = {
 
 
 # =========================================================================
-# RIWAYAT SCREENING HARIAN (biar kuota GoAPI hemat - broker summary yang
-# udah pernah diambil hari ini nggak ditarik ulang, kecuali dipaksa refresh)
+# RIWAYAT SCREENING (Google Sheets sebagai database eksternal, lewat
+# jembatan Google Apps Script - TANPA Google Cloud Console/service account)
+# - Riwayat PERMANEN (nggak auto-kehapus tiap hari) karena udah pindah ke
+#   penyimpanan eksternal, bukan file lokal server lagi.
+# - Dipakai buat 2 hal: (1) log semua screening (single & massal/all),
+#   (2) cache broker summary per-ticker per-hari biar kuota GoAPI hemat
+#   (kalau ticker udah pernah di-screening HARI INI, datanya dipakai ulang).
 # =========================================================================
-HISTORY_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "screening_history.json")
+HISTORY_HEADERS = ["Tanggal", "Mode", "Waktu", "Ticker", "Harga", "RSI",
+                    "ScreenerLolos", "BrokerSummaryStatus", "DataJSON"]
+
+HISTORY_FALLBACK_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "riwayat_screening_lokal.json")
 
 
 def _today_str() -> str:
     return datetime.now().strftime("%Y-%m-%d")
 
 
-def _load_history() -> dict:
+def _get_apps_script_config():
     """
-    Baca riwayat screening hari ini. Kalau tanggal di file beda dari hari
-    ini, riwayat lama DIANGGAP KEHAPUS (dimulai kosong lagi) - jadi reset-nya
-    otomatis tiap ganti hari, tanpa perlu proses hapus manual.
+    Balikin (url, token) Web App Google Apps Script dari Streamlit Secrets,
+    atau (None, None) kalau belum diisi (app tetap jalan normal, fallback
+    ke penyimpanan lokal - lihat catatan di _load_history_local).
 
-    CATATAN JUJUR: ini nyimpen ke file lokal di server. Kalau kamu hosting
-    di Streamlit Cloud versi gratis, container-nya bisa di-restart otomatis
-    kalau app sempat "tidur" karena nggak ada yang buka lama - kalau itu
-    kejadian, riwayat ikut ke-reset walau masih hari yang sama. Ini
-    keterbatasan hosting gratisan, bukan bug di kode.
+    CARA SETUP (sekali aja, lihat panduan lengkap dari saya):
+    1. Tempel skrip 'apps_script_riwayat.gs' ke Google Sheet kamu lewat
+       Extensions > Apps Script, lalu Deploy sebagai Web App.
+    2. Isi st.secrets dengan "APPS_SCRIPT_URL" (URL Web App hasil Deploy)
+       dan "APPS_SCRIPT_TOKEN" (token rahasia yang kamu set di skrip itu)
+       di Streamlit Cloud -> Settings -> Secrets.
     """
-    if not os.path.exists(HISTORY_FILE):
-        return {"date": _today_str(), "tickers": {}}
     try:
-        with open(HISTORY_FILE, "r", encoding="utf-8") as f:
-            data = json.load(f)
+        url = st.secrets.get("APPS_SCRIPT_URL")
+        token = st.secrets.get("APPS_SCRIPT_TOKEN")
     except Exception:
-        return {"date": _today_str(), "tickers": {}}
-    if data.get("date") != _today_str():
-        return {"date": _today_str(), "tickers": {}}
-    data.setdefault("tickers", {})
-    return data
+        return None, None
+    if not url or not token:
+        return None, None
+    return url, token
 
 
-def _save_history(data: dict):
+def _load_history_local() -> dict:
+    if not os.path.exists(HISTORY_FALLBACK_FILE):
+        return {"rows": []}
     try:
-        os.makedirs(os.path.dirname(HISTORY_FILE), exist_ok=True)
-        with open(HISTORY_FILE, "w", encoding="utf-8") as f:
+        with open(HISTORY_FALLBACK_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {"rows": []}
+
+
+def _save_history_local(data: dict):
+    try:
+        os.makedirs(os.path.dirname(HISTORY_FALLBACK_FILE), exist_ok=True)
+        with open(HISTORY_FALLBACK_FILE, "w", encoding="utf-8") as f:
             json.dump(data, f, default=str)
     except Exception:
-        pass  # gagal simpan (mis. filesystem read-only) - jangan bikin app crash
+        pass
+
+
+def _append_history_row(mode: str, ticker: str = "", harga="", rsi="", screener_lolos: str = "",
+                         broker_status: str = "-", data_obj=None) -> bool:
+    """Simpan 1 baris riwayat. Balikin True kalau berhasil ke Google Sheets, False kalau fallback lokal."""
+    row = {
+        "Tanggal": _today_str(), "Mode": mode, "Waktu": datetime.now().strftime("%H:%M:%S"),
+        "Ticker": ticker, "Harga": harga, "RSI": rsi, "ScreenerLolos": screener_lolos,
+        "BrokerSummaryStatus": broker_status,
+        "DataJSON": json.dumps(data_obj, default=str) if data_obj is not None else "",
+    }
+    url, token = _get_apps_script_config()
+    if url:
+        try:
+            payload = dict(row)
+            payload["token"] = token
+            resp = requests.post(url, json=payload, timeout=10)
+            if resp.ok and "error" not in resp.json():
+                return True
+        except Exception:
+            pass
+    local = _load_history_local()
+    local.setdefault("rows", []).append(row)
+    _save_history_local(local)
+    return False
+
+
+def _read_history_rows(mode: str = None, date_filter: str = None) -> list:
+    url, token = _get_apps_script_config()
+    if url:
+        try:
+            params = {"token": token}
+            if mode:
+                params["mode"] = mode
+            if date_filter:
+                params["date"] = date_filter
+            resp = requests.get(url, params=params, timeout=10)
+            data = resp.json()
+            if "rows" in data:
+                return data["rows"]
+        except Exception:
+            pass
+    records = _load_history_local().get("rows", [])
+    if date_filter:
+        records = [r for r in records if r.get("Tanggal") == date_filter]
+    if mode:
+        records = [r for r in records if r.get("Mode") == mode]
+    return records
+
+
+def _get_cached_bandar_today(ticker: str):
+    """Cari data broker summary ticker ini yang udah pernah diambil HARI INI (buat hemat kuota)."""
+    rows = _read_history_rows(mode="single", date_filter=_today_str())
+    for r in reversed(rows):
+        if r.get("Ticker") == ticker and r.get("DataJSON"):
+            try:
+                return json.loads(r["DataJSON"]), r.get("Waktu")
+            except Exception:
+                continue
+    return None, None
 
 
 def build_evidence_chart(df: pd.DataFrame, ticker: str, trade_levels: dict = None, highlight_item: dict = None):
@@ -685,6 +762,7 @@ if run_button:
                 "Lolos Screener": ", ".join(lolos_tags) if lolos_tags else "-",
                 "Alasan": ", ".join(all_reasons) if all_reasons else "-",
                 "Link Berita": news_url or "",
+                "_screener_keys": [s for s in active_screeners if screeners.get(s, {}).get("passed")],
             })
 
     progress_bar.empty()
@@ -693,6 +771,23 @@ if run_button:
     st.session_state.chart_data = chart_data
     st.session_state.trade_levels_map = trade_levels_map
     st.session_state.last_run = datetime.now().strftime("%d %b %Y, %H:%M:%S")
+
+    # Log riwayat run screening MASSAL ini ke Google Sheets (permanen, nggak
+    # kehapus tiap hari) - simpan top 50 by skor biar ukuran datanya wajar.
+    _top_for_log = sorted(results, key=lambda r: r["Skor"], reverse=True)[:50]
+    _top_for_log_clean = [{k: v for k, v in r.items() if k != "_screener_keys"} for r in _top_for_log]
+    _append_history_row(
+        mode="all", ticker="ALL", harga="", rsi="",
+        screener_lolos=f"{len(results)} saham lolos dari {len(watchlist)} discan "
+                        f"({', '.join(SCREENER_INFO[s]['label'] for s in active_screeners)})",
+        broker_status="-",
+        data_obj={
+            "watchlist_count": len(watchlist),
+            "active_screeners": [SCREENER_INFO[s]["label"] for s in active_screeners],
+            "total_lolos": len(results),
+            "top_results": _top_for_log_clean,
+        },
+    )
 
 if st.session_state.results is not None:
     st.caption(f"Terakhir dijalankan: {st.session_state.last_run}")
@@ -723,17 +818,39 @@ if st.session_state.results is not None:
 
     st.subheader("Kandidat Hasil Screening")
     if len(df_results) > 0:
-        st.dataframe(
-            df_results.sort_values("Skor", ascending=False),
-            width='stretch',
-            hide_index=True,
-            column_config={
-                "Harga": st.column_config.NumberColumn(format="%d"),
-                "Link Berita": st.column_config.LinkColumn(
-                    "Cek Berita Manual", display_text="🔗 Buka"
-                ),
-            },
-        )
+        display_cols = ["Ticker", "Harga", "Skor", "RSI", "Lolos Screener", "Alasan", "Link Berita"]
+        col_config = {
+            "Harga": st.column_config.NumberColumn(format="%d"),
+            "Link Berita": st.column_config.LinkColumn("Cek Berita Manual", display_text="🔗 Buka"),
+        }
+        any_table_shown = False
+        for screener_key in ["day_trade", "bsjp", "bpjs"]:
+            if screener_key not in active_screeners:
+                continue
+            screener_label = SCREENER_INFO[screener_key]["label"]
+            df_screener = df_results[df_results["_screener_keys"].apply(lambda keys, k=screener_key: k in keys)]
+            df_screener = df_screener.sort_values("Skor", ascending=False)
+            st.markdown(f"##### {screener_label} — {len(df_screener)} saham lolos")
+            if len(df_screener) > 0:
+                st.dataframe(df_screener[display_cols], width='stretch', hide_index=True, column_config=col_config)
+                any_table_shown = True
+            else:
+                st.caption("Nggak ada saham yang lolos screener ini hari ini.")
+        if not any_table_shown:
+            st.caption("Belum ada saham yang lolos screener manapun.")
+
+        with st.expander("📜 Riwayat Screening Massal (Screening All) — Log Semua Run", expanded=False):
+            st.caption(
+                "Log ini permanen (tersimpan di Google Sheets kalau sudah kamu setting, "
+                "kalau belum fallback ke file lokal server) - nggak kehapus tiap hari."
+            )
+            all_runs = _read_history_rows(mode="all")
+            if all_runs:
+                run_rows = [{"Tanggal": r.get("Tanggal"), "Waktu": r.get("Waktu"),
+                             "Ringkasan": r.get("ScreenerLolos")} for r in reversed(all_runs)]
+                st.dataframe(pd.DataFrame(run_rows), width='stretch', hide_index=True)
+            else:
+                st.caption("Belum ada riwayat run screening massal tersimpan.")
 
         st.markdown("---")
         st.subheader("🔍 Bukti Validitas per Saham")
@@ -854,8 +971,6 @@ st.markdown("---")
 st.header("🔎 Screening Satu Saham")
 st.caption("Cek satu saham langsung tanpa nunggu scan semua watchlist selesai dulu.")
 
-_history = _load_history()
-
 col_input, col_button = st.columns([3, 1])
 single_ticker_input = col_input.text_input(
     "Kode saham (contoh: BBCA, TLKM, GOTO):", value="", key="single_ticker_input",
@@ -882,13 +997,14 @@ if not goapi_configured:
 _ticker_preview = single_ticker_input.upper() if single_ticker_input else None
 if _ticker_preview and not _ticker_preview.endswith(".JK"):
     _ticker_preview += ".JK"
-_cached_entry_preview = _history["tickers"].get(_ticker_preview) if _ticker_preview else None
+_cached_bandar_preview, _cached_bandar_time = (_get_cached_bandar_today(_ticker_preview)
+                                                if _ticker_preview else (None, None))
 force_refresh_bandar = False
-if _cached_entry_preview and _cached_entry_preview.get("bandar"):
+if _cached_bandar_preview:
     st.caption(
         f"📦 **{_ticker_preview}** udah pernah di-screening hari ini pukul "
-        f"**{_cached_entry_preview.get('bandar_fetched_at', '-')}** - broker summary bakal "
-        "dipakai dari cache (hemat kuota GoAPI), bukan manggil API lagi."
+        f"**{_cached_bandar_time or '-'}** - broker summary bakal dipakai dari cache "
+        "(hemat kuota GoAPI), bukan manggil API lagi."
     )
     force_refresh_bandar = st.checkbox(
         "🔄 Paksa ambil ulang data broker summary (abaikan cache hari ini)",
@@ -921,9 +1037,7 @@ if single_cek_button and single_ticker_input:
 
             bandar_single = None
             bandar_from_cache = False
-            history = _load_history()
-            cached_entry = history["tickers"].get(ticker_full)
-            cached_bandar = cached_entry.get("bandar") if cached_entry else None
+            cached_bandar, cached_bandar_time = _get_cached_bandar_today(ticker_full)
             # Cache dianggap valid buat request ini kalau: ada, dan (nggak minta
             # buy-the-dip ATAU buy-the-dip-nya udah pernah kesimpan juga), dan
             # user nggak nge-klik "paksa ambil ulang".
@@ -960,19 +1074,24 @@ if single_cek_button and single_ticker_input:
             st.session_state.single_df = df_single
             st.session_state.single_trade_levels = trade_levels_single
 
-            # Simpan/perbarui riwayat hari ini (auto-reset besok, lihat _load_history).
-            now_str = datetime.now().strftime("%H:%M:%S")
-            entry = history["tickers"].setdefault(ticker_full, {})
-            entry["last_checked"] = now_str
-            entry["price"] = float(tech_single.get("price", 0) or 0)
-            entry["rsi"] = float(tech_single.get("rsi", 0) or 0)
-            entry["screeners_passed"] = [
-                SCREENER_INFO[k]["label"] for k, v in screeners_single.items() if v["passed"]
-            ]
-            if include_bandarmology_single and goapi_configured and not bandar_from_cache:
-                entry["bandar"] = bandar_single
-                entry["bandar_fetched_at"] = now_str
-            _save_history(history)
+            # Simpan riwayat ke Google Sheets (permanen). DataJSON cuma diisi
+            # kalau broker summary BARU diambil (bukan dari cache) - biar nggak
+            # dobel-nyimpen data yang sama berkali-kali.
+            screeners_passed_labels = [SCREENER_INFO[k]["label"] for k, v in screeners_single.items() if v["passed"]]
+            broker_status = "-"
+            data_to_log = None
+            if include_bandarmology_single and goapi_configured:
+                if bandar_from_cache:
+                    broker_status = f"Cache (diambil {cached_bandar_time})"
+                else:
+                    broker_status = "Diambil baru"
+                    data_to_log = bandar_single
+            _append_history_row(
+                mode="single", ticker=ticker_full,
+                harga=float(tech_single.get("price", 0) or 0), rsi=float(tech_single.get("rsi", 0) or 0),
+                screener_lolos=", ".join(screeners_passed_labels) or "-",
+                broker_status=broker_status, data_obj=data_to_log,
+            )
 
 single_result = st.session_state.single_result
 
@@ -1145,29 +1264,26 @@ else:
 
 
 # --- Riwayat Screening Hari Ini (di luar blok if, biar selalu kelihatan) ---
-st.markdown("#### 📜 Riwayat Screening Hari Ini")
-_history_display = _load_history()
-_hist_tickers = _history_display.get("tickers", {})
-if _hist_tickers:
-    hist_rows = []
-    for tkr, e in _hist_tickers.items():
-        hist_rows.append({
-            "Ticker": tkr,
-            "Terakhir Dicek": e.get("last_checked", "-"),
-            "Harga": f"{e.get('price', 0):,.0f}" if e.get("price") else "-",
-            "RSI": f"{e.get('rsi', 0):.1f}" if e.get("rsi") else "-",
-            "Screener Lolos": ", ".join(e.get("screeners_passed", [])) or "-",
-            "Broker Summary": f"✅ Diambil {e.get('bandar_fetched_at', '')}" if e.get("bandar") else "❌ Belum",
-        })
-    st.dataframe(pd.DataFrame(hist_rows), width='stretch', hide_index=True)
+st.markdown("#### 📜 Riwayat Screening Satu Saham Hari Ini")
+_hist_rows_today = _read_history_rows(mode="single", date_filter=_today_str())
+if _hist_rows_today:
+    hist_display = [{
+        "Waktu": r.get("Waktu"), "Ticker": r.get("Ticker"),
+        "Harga": f"{float(r.get('Harga') or 0):,.0f}" if r.get("Harga") not in ("", None) else "-",
+        "RSI": f"{float(r.get('RSI') or 0):.1f}" if r.get("RSI") not in ("", None) else "-",
+        "Screener Lolos": r.get("ScreenerLolos") or "-",
+        "Broker Summary": r.get("BrokerSummaryStatus") or "-",
+    } for r in reversed(_hist_rows_today)]
+    st.dataframe(pd.DataFrame(hist_display), width='stretch', hide_index=True)
+    _gs_active = _get_apps_script_config()[0] is not None
     st.caption(
-        f"Riwayat ini otomatis kehapus tiap ganti hari (tanggal server: {_history_display['date']}). "
-        "Broker Summary yang udah 'Diambil' nggak akan manggil API lagi kalau kamu cek ulang saham "
-        "yang sama hari ini, kecuali kamu centang 'Paksa ambil ulang'."
+        ("📗 Tersimpan di Google Sheets - riwayat ini PERMANEN, nggak kehapus tiap hari."
+         if _gs_active else
+         "📁 Google Sheets belum di-setting, riwayat ini sementara disimpan di file lokal server "
+         "(bisa hilang kalau server restart). Lihat panduan setup Google Sheets biar permanen.")
+        + " Broker Summary yang statusnya 'Diambil' nggak akan manggil API lagi kalau kamu cek "
+          "ulang saham yang sama hari ini, kecuali centang 'Paksa ambil ulang'."
     )
-    if st.button("🗑️ Hapus riwayat hari ini sekarang"):
-        _save_history({"date": _today_str(), "tickers": {}})
-        st.rerun()
 else:
     st.caption("Belum ada saham yang di-screening hari ini.")
 
