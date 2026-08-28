@@ -1500,16 +1500,18 @@ def check_broker_accumulation(symbol: str, date: str = None) -> dict:
 
 
 BUY_THE_DIP_DESCRIPTION = (
-    "Cek apakah dalam beberapa hari terakhir ada broker smart money net-buy "
+    "Cek apakah dalam 30 hari terakhir ada broker smart money net-buy "
     "BESAR justru pas harga saham lagi turun tajam (>=1% dalam sehari). Pola "
     "ini sering diartikan sebagai 'buy the dip' institusi - mereka manfaatin "
     "harga turun buat masuk lebih murah, bukan ikut panic-sell. INGAT: fungsi "
-    "ini manggil API GoAPI beberapa kali sekaligus (1x per hari yang turun), "
-    "jadi lebih boros kuota - makanya cuma tersedia di mode Screening Satu Saham."
+    "ini manggil API GoAPI sekali per hari yang harganya turun dalam 30 hari "
+    "terakhir (bisa belasan kali kalau bulan itu banyak hari merah), jadi "
+    "CUKUP BOROS KUOTA - makanya cuma tersedia di mode Screening Satu Saham, "
+    "dan sebaiknya dipakai sesekali, bukan tiap kali screening."
 )
 
 
-def check_buy_the_dip_accumulation(df: pd.DataFrame, symbol: str, lookback_days: int = 5) -> dict:
+def check_buy_the_dip_accumulation(df: pd.DataFrame, symbol: str, lookback_days: int = 30) -> dict:
     """
     Buy-the-dip saat broker akumulasi crash (Video 27) - cek beberapa hari
     terakhir: apakah ada broker smart money net-buy besar JUSTRU pas harga
@@ -1569,7 +1571,13 @@ def compute_bandarmology_score(ticker: str, df: pd.DataFrame, include_buy_the_di
         return {"score": 0, "reasons": [], "available": False, "detail": None,
                 "description": BROKER_SUMMARY_DESCRIPTION}
 
-    acc = check_broker_accumulation(ticker)
+    # PENTING: jangan pakai tanggal "hari ini" dari jam sistem - kalau hari
+    # ini libur bursa/weekend atau GoAPI belum publish data buat hari
+    # berjalan, hasilnya bakal kosong. Pakai tanggal TRANSAKSI TERAKHIR yang
+    # beneran valid dari data harga (df) yang udah kita fetch dari Yahoo
+    # Finance - ini jauh lebih reliable buat mastiin raw_table ke-isi.
+    last_trading_date = df.index[-1].strftime("%Y-%m-%d") if len(df) else None
+    acc = check_broker_accumulation(ticker, date=last_trading_date)
     score = 0
     reasons = []
     if acc["triggered"]:
