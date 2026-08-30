@@ -155,6 +155,19 @@ def _today_str() -> str:
     return datetime.now().strftime("%Y-%m-%d")
 
 
+def _format_reasons_bullets(reasons: list) -> str:
+    """
+    Susun list alasan jadi poin-poin rapi (satu alasan per baris, diawali
+    "•"), bukan digabung koma jadi satu paragraf panjang. Dipakai di
+    tampilan app MAUPUN pas disimpan ke Google Sheets - kalau cell di
+    Sheets di-set "Wrap text", ini bakal kebaca sebagai list ke bawah,
+    bukan satu baris ngga jelas.
+    """
+    if not reasons:
+        return "-"
+    return "\n".join(f"• {r}" for r in reasons if r)
+
+
 def _get_apps_script_config():
     """
     Balikin (url, token) Web App Google Apps Script dari Streamlit Secrets,
@@ -255,6 +268,36 @@ def _get_cached_bandar_today(ticker: str):
             except Exception:
                 continue
     return None, None
+
+
+# =========================================================================
+# BATAS HARIAN GoAPI - biar kuota nggak abis tanpa sadar
+# =========================================================================
+# INFO PEMAKAIAN GoAPI (bukan batasan keras - cuma info transparansi)
+# =========================================================================
+# Nggak ada blokir di sini. Tiap pengecekan Broker Summary itu sendiri udah
+# didesain hemat: 1x panggilan API buat broker summary biasa, dan Buy-the-Dip
+# cuma nambah MAKSIMAL 1x panggilan lagi (cek hari merah paling baru aja,
+# bukan tiap hari merah) - lihat check_buy_the_dip_accumulation() di
+# stock_screener.py. Counter di bawah cuma buat kamu pantau, nggak menghalangi apa-apa.
+
+def _count_goapi_calls_today() -> int:
+    """
+    Hitung PERSIS berapa kali GoAPI udah kepanggil hari ini, dari riwayat
+    (semua mode). Cuma hitung baris yang statusnya "Diambil baru" (bukan
+    dari cache), dan ambil angka "api_calls_made" dari DataJSON masing-masing
+    (fallback ke 1 kalau field itu nggak ada, misal riwayat versi lama).
+    """
+    rows = _read_history_rows(date_filter=_today_str())
+    total = 0
+    for r in rows:
+        if str(r.get("BrokerSummaryStatus", "")).startswith("Diambil baru") and r.get("DataJSON"):
+            try:
+                data = json.loads(r["DataJSON"])
+                total += int(data.get("api_calls_made", 1))
+            except Exception:
+                total += 1
+    return total
 
 
 def build_evidence_chart(df: pd.DataFrame, ticker: str, trade_levels: dict = None, highlight_item: dict = None):
@@ -657,6 +700,33 @@ include_macro = st.sidebar.checkbox(
 )
 
 goapi_configured = "ISI_" not in GOAPI_API_KEY and bool(GOAPI_API_KEY)
+
+# =========================================================================
+# PIN AKSES GoAPI - biar nggak sembarang orang yang buka app ini bisa
+# manggil API (yang notabene kamu bayar) tanpa izin kamu dulu.
+# =========================================================================
+GOAPI_ACCESS_PIN = "080603"
+
+if "goapi_unlocked" not in st.session_state:
+    st.session_state.goapi_unlocked = False
+
+if goapi_configured and not st.session_state.goapi_unlocked:
+    with st.sidebar.expander("🔒 PIN Akses Broker Summary (GoAPI)", expanded=False):
+        _pin_input = st.text_input(
+            "Masukkan PIN buat buka fitur Broker Summary:", type="password", key="goapi_pin_input",
+        )
+        if _pin_input:
+            if _pin_input == GOAPI_ACCESS_PIN:
+                st.session_state.goapi_unlocked = True
+                st.success("✅ PIN benar - fitur Broker Summary terbuka.")
+            else:
+                st.error("❌ PIN salah.")
+
+# goapi_configured yang dipakai di seluruh app SEKARANG juga mensyaratkan
+# PIN udah benar - kalau belum, semua toggle Broker Summary tetap disabled
+# walaupun API key-nya udah keisi.
+goapi_configured = goapi_configured and st.session_state.goapi_unlocked
+
 include_bandarmology = False  # Broker Summary (GoAPI) SENGAJA dimatikan buat mode Screening
                                # Massal - biar kuota API nggak kepakai per-saham x puluhan
                                # saham. Fitur ini cuma bisa diaktifkan di bagian
@@ -666,7 +736,7 @@ st.sidebar.caption(
     "📡 Broker Summary (GoAPI) nggak tersedia di mode ini biar kuota API nggak boros "
     "kalau nge-scan banyak saham sekaligus. Buka bagian **'🔎 Screening Satu Saham'** "
     "di bawah kalau mau lihat data broker summary lengkap + validasinya per saham."
-    + ("" if goapi_configured else " (API key GoAPI juga belum diisi di stock_screener.py.)")
+    + ("" if "ISI_" not in GOAPI_API_KEY and bool(GOAPI_API_KEY) else " (API key GoAPI juga belum diisi di stock_screener.py.)")
 )
 
 run_button = st.sidebar.button("🔍 Jalankan Screening", type="primary", width='stretch')
@@ -760,7 +830,7 @@ if run_button:
                 "Skor": total_score,
                 "RSI": round(tech["rsi"], 1),
                 "Lolos Screener": ", ".join(lolos_tags) if lolos_tags else "-",
-                "Alasan": ", ".join(all_reasons) if all_reasons else "-",
+                "Alasan": _format_reasons_bullets(all_reasons),
                 "Link Berita": news_url or "",
                 "_screener_keys": [s for s in active_screeners if screeners.get(s, {}).get("passed")],
             })
@@ -772,12 +842,16 @@ if run_button:
     st.session_state.trade_levels_map = trade_levels_map
     st.session_state.last_run = datetime.now().strftime("%d %b %Y, %H:%M:%S")
 
-    # Log riwayat run screening MASSAL ini ke Google Sheets (permanen, nggak
-    # kehapus tiap hari) - simpan top 50 by skor biar ukuran datanya wajar.
-    _top_for_log = sorted(results, key=lambda r: r["Skor"], reverse=True)[:50]
-    _top_for_log_clean = [{k: v for k, v in r.items() if k != "_screener_keys"} for r in _top_for_log]
+    # Log riwayat run screening MASSAL ini ke Google Sheets - SATU BARIS
+    # PER SAHAM (bukan digepyok jadi 1 baris berisi JSON semua saham kayak
+    # sebelumnya), biar kebaca rapi langsung di Sheets. Plus 1 baris ringkasan
+    # di awal buat rekap total. Dibatasin ke top 30 by skor biar nggak
+    # kelamaan (tiap baris = 1 request ke Google Sheets).
+    MAX_ROWS_LOGGED_PER_SCAN = 30
+    _top_for_log = sorted(results, key=lambda r: r["Skor"], reverse=True)[:MAX_ROWS_LOGGED_PER_SCAN]
+
     _append_history_row(
-        mode="all", ticker="ALL", harga="", rsi="",
+        mode="all_summary", ticker="RINGKASAN", harga="", rsi="",
         screener_lolos=f"{len(results)} saham lolos dari {len(watchlist)} discan "
                         f"({', '.join(SCREENER_INFO[s]['label'] for s in active_screeners)})",
         broker_status="-",
@@ -785,9 +859,19 @@ if run_button:
             "watchlist_count": len(watchlist),
             "active_screeners": [SCREENER_INFO[s]["label"] for s in active_screeners],
             "total_lolos": len(results),
-            "top_results": _top_for_log_clean,
+            "rows_logged": len(_top_for_log),
         },
     )
+
+    if _top_for_log:
+        with st.spinner(f"Menyimpan {len(_top_for_log)} baris riwayat ke Sheets (1 baris per saham)..."):
+            for r in _top_for_log:
+                _append_history_row(
+                    mode="all", ticker=r["Ticker"], harga=r["Harga"], rsi=r["RSI"],
+                    screener_lolos=r["Lolos Screener"],
+                    broker_status="-",
+                    data_obj={"skor": r["Skor"], "alasan": r["Alasan"], "link_berita": r["Link Berita"]},
+                )
 
 if st.session_state.results is not None:
     st.caption(f"Terakhir dijalankan: {st.session_state.last_run}")
@@ -988,12 +1072,20 @@ include_bandarmology_single = single_col_a.checkbox(
 )
 include_buy_the_dip_single = single_col_b.checkbox(
     "📉 Cek juga Buy-the-Dip (30 hari terakhir)", value=False, disabled=not include_bandarmology_single,
-    help="Cek apakah broker smart money akumulasi pas harga lagi turun tajam, dalam "
-         "30 hari terakhir. Manggil API sekali per hari yang harganya turun (bisa "
-         "belasan kali, cukup boros kuota) - makanya opsional dan disarankan sesekali aja.",
+    help="Cek apakah broker smart money akumulasi pas harga lagi turun tajam. HEMAT API: "
+         "cuma cek 1 hari merah paling baru dalam 30 hari terakhir (bukan tiap hari merah), "
+         "jadi maksimal +1x panggilan API doang - atau 0x kalau nggak ada hari merah sama sekali.",
 )
 if not goapi_configured:
-    st.caption("⚠️ GOAPI_API_KEY belum diisi di stock_screener.py - Broker Summary nggak akan jalan.")
+    st.caption("⚠️ GOAPI_API_KEY belum diisi di stock_screener.py, atau PIN akses belum dimasukkan/benar - Broker Summary nggak akan jalan.")
+else:
+    _calls_today = _count_goapi_calls_today()
+    st.caption(
+        f"ℹ️ **Kuota GoAPI terpakai hari ini: {_calls_today} panggilan** (info doang, bukan "
+        f"batasan - tiap pengecekan di sini emang udah didesain hemat: maksimal 1 panggilan "
+        f"buat Broker Summary + 1 lagi kalau Buy-the-Dip diaktifkan). Cek dari cache TIDAK "
+        f"ikut dihitung ke sini."
+    )
 
 _ticker_preview = single_ticker_input.upper() if single_ticker_input else None
 if _ticker_preview and not _ticker_preview.endswith(".JK"):
@@ -1051,6 +1143,10 @@ if single_cek_button and single_ticker_input:
                     bandar_single = cached_bandar
                     bandar_from_cache = True
                 else:
+                    # Nggak ada gate/batasan di sini - pengecekannya sendiri
+                    # udah didesain hemat (maksimal 1 panggilan API buat
+                    # broker summary + 1 lagi kalau Buy-the-Dip diaktifkan,
+                    # lihat check_buy_the_dip_accumulation() di stock_screener.py).
                     bandar_single = compute_bandarmology_score(
                         ticker_full, df_single, include_buy_the_dip=include_buy_the_dip_single,
                     )
