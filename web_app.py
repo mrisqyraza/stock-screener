@@ -45,7 +45,6 @@ from stock_screener import (
     BROKER_SMART_MONEY,
     BROKER_RETAIL,
     BROKER_INSIDER_MAP,
-    WATCHLIST as DEFAULT_WATCHLIST,
 )
 
 # Indikator SKOR tambahan (di luar 3 screener utama) yang bisa dipilih user.
@@ -133,6 +132,16 @@ KEY_BOX_MAP = {
     "dt_ma20":     {"row": 1, "candles": 21},
     "dt_rsi":      {"row": 3, "candles": 3},
     "dt_value":    {"row": 2, "candles": 1},
+    # Indikator "Skor Tambahan" - sebelumnya nggak pernah muncul di daftar
+    # bukti sama sekali (baru diperbaiki), sekarang punya area kotak sendiri.
+    "rsi_oversold":     {"row": 3, "candles": 3},
+    "macd_cross":       {"row": 4, "candles": 3},
+    "volume_spike":     {"row": 2, "candles": 1},
+    "above_ma20":       {"row": 1, "candles": 20},
+    "uptrend_ma":       {"row": 1, "candles": 20},
+    "bollinger_riding": {"row": 1, "candles": 3},
+    "near_support":     {"row": 1, "candles": 1},
+    "vcp_pattern":      {"row": 1, "candles": 30},
 }
 
 
@@ -330,6 +339,19 @@ def build_evidence_chart(df: pd.DataFrame, ticker: str, trade_levels: dict = Non
                               line=dict(color="orange", width=1.3)), row=1, col=1)
     fig.add_trace(go.Scatter(x=chart_df.index, y=ma20, name="MA20",
                               line=dict(color="blue", width=1.3)), row=1, col=1)
+
+    # Bollinger Bands (20, 2) - dibutuhin buat kasih bukti visual "Riding
+    # Upper Bollinger Band": tanpa garis band-nya digambar, nggak ada yang
+    # bisa dikotakkan buat nunjukkin harga lagi "nempel" di band atas.
+    bb_mid = df["Close"].rolling(20).mean()
+    bb_std = df["Close"].rolling(20).std()
+    bb_upper = (bb_mid + 2 * bb_std).tail(90)
+    bb_lower = (bb_mid - 2 * bb_std).tail(90)
+    fig.add_trace(go.Scatter(x=chart_df.index, y=bb_upper, name="BB Upper",
+                              line=dict(color="#c39bd3", width=1, dash="dot")), row=1, col=1)
+    fig.add_trace(go.Scatter(x=chart_df.index, y=bb_lower, name="BB Lower",
+                              line=dict(color="#c39bd3", width=1, dash="dot"),
+                              fill="tonexty", fillcolor="rgba(195,155,211,0.07)"), row=1, col=1)
 
     try:
         sr = find_support_resistance(df)
@@ -619,18 +641,7 @@ st.warning(
 
 st.sidebar.header("⚙️ Pengaturan")
 
-scan_all = st.sidebar.checkbox(
-    "🌐 Scan SEMUA saham IDX (~900+)",
-    value=False,
-    help="Kalau dicentang, semua saham IDX yang tercatat bakal di-scan. "
-         "Kalau nggak, pakai daftar bawaan LQ45 + saham konglomerat "
-         "(lihat WATCHLIST di stock_screener.py). Prosesnya jauh lebih "
-         "lama kalau scan semua (bisa beberapa menit).",
-)
-
-st.sidebar.caption(
-    f"Mode: {'Semua saham IDX (~900+)' if scan_all else f'Watchlist bawaan ({len(DEFAULT_WATCHLIST)} saham: LQ45 + konglomerat)'}"
-)
+st.sidebar.caption("Mode: Semua saham IDX (~900+) - watchlist bawaan (LQ45 + konglomerat) udah dihapus.")
 
 st.sidebar.markdown("---")
 st.sidebar.subheader("🎯 Pilih Screener")
@@ -765,6 +776,7 @@ if "results" not in st.session_state:
     st.session_state.results = None
     st.session_state.last_run = None
     st.session_state.evidence_map = {}
+    st.session_state.indicators_map = {}
     st.session_state.chart_data = {}
     st.session_state.trade_levels_map = {}
     st.session_state.macro_context = None
@@ -780,17 +792,15 @@ if run_button:
     else:
         st.session_state.macro_context = None
 
-    if scan_all:
-        with st.spinner("Mengambil daftar semua saham IDX..."):
-            watchlist = fetch_all_idx_tickers()
-        if not watchlist:
-            st.error("Gagal mengambil daftar saham IDX. Cek koneksi internet, atau coba lagi nanti.")
-            st.stop()
-    else:
-        watchlist = DEFAULT_WATCHLIST
+    with st.spinner("Mengambil daftar semua saham IDX..."):
+        watchlist = fetch_all_idx_tickers()
+    if not watchlist:
+        st.error("Gagal mengambil daftar saham IDX. Cek koneksi internet, atau coba lagi nanti.")
+        st.stop()
 
     results = []
     evidence_map = {}
+    indicators_map = {}
     chart_data = {}
     trade_levels_map = {}
     progress_bar = st.progress(0, text="Memulai screening (mode batch)...")
@@ -834,6 +844,7 @@ if run_button:
                     lolos_tags.append(SCREENER_INFO[s]["label"].split(" ", 1)[1])
 
             evidence_map[ticker] = {s: screeners[s]["evidence"] for s in active_screeners if s in screeners}
+            indicators_map[ticker] = tech["indicators"]
             chart_data[ticker] = df
             try:
                 trade_levels_map[ticker] = compute_trade_levels(df)
@@ -854,6 +865,7 @@ if run_button:
     progress_bar.empty()
     st.session_state.results = pd.DataFrame(results)
     st.session_state.evidence_map = evidence_map
+    st.session_state.indicators_map = indicators_map
     st.session_state.chart_data = chart_data
     st.session_state.trade_levels_map = trade_levels_map
     st.session_state.last_run = datetime.now().strftime("%d %b %Y, %H:%M:%S")
@@ -999,6 +1011,23 @@ if st.session_state.results is not None:
                     display = f"{status_icon} [{screener_label}] {item['label']}"
                     criteria_options.append(display)
                     criteria_lookup[display] = item
+
+        # Indikator "Skor Tambahan" (RSI, MACD, Volume Spike, Bollinger,
+        # VCP, dst) - sebelumnya nggak pernah masuk daftar bukti sama
+        # sekali, sekarang dimasukin juga biar semua indikator yang
+        # dicentang bisa dipilih & dikotakkan di grafik.
+        if pilihan_ticker in st.session_state.indicators_map:
+            for ind_key, ind_data in st.session_state.indicators_map[pilihan_ticker].items():
+                status_icon = "✅" if ind_data["triggered"] else "❌"
+                display = f"{status_icon} [Indikator] {ind_data['label']}"
+                criteria_options.append(display)
+                criteria_lookup[display] = {
+                    "key": ind_key,
+                    "label": ind_data["label"],
+                    "passed": ind_data["triggered"],
+                    "value": ind_data.get("detail") or "Kriteria nggak terpenuhi hari ini",
+                    "description": INDICATOR_DESCRIPTIONS.get(ind_key),
+                }
 
         pilihan_kriteria = st.selectbox("Klik untuk pilih indikator/kriteria:", criteria_options)
 
@@ -1345,6 +1374,20 @@ else:
             display = f"{status_icon} [{screener_label}] {item['label']}"
             single_criteria_options.append(display)
             single_criteria_lookup[display] = item
+
+    # Indikator "Skor Tambahan" - sama kayak di mode Screening Massal,
+    # dimasukin juga ke daftar bukti biar Bollinger/VCP/dst bisa dikotakkan.
+    for ind_key, ind_data in single_result["tech"]["indicators"].items():
+        status_icon = "✅" if ind_data["triggered"] else "❌"
+        display = f"{status_icon} [Indikator] {ind_data['label']}"
+        single_criteria_options.append(display)
+        single_criteria_lookup[display] = {
+            "key": ind_key,
+            "label": ind_data["label"],
+            "passed": ind_data["triggered"],
+            "value": ind_data.get("detail") or "Kriteria nggak terpenuhi hari ini",
+            "description": INDICATOR_DESCRIPTIONS.get(ind_key),
+        }
 
     st.markdown("#### 🔍 Bukti Visual per Kriteria")
     pilihan_kriteria_single = st.selectbox(
