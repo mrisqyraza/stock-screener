@@ -704,13 +704,24 @@ goapi_configured = "ISI_" not in GOAPI_API_KEY and bool(GOAPI_API_KEY)
 # =========================================================================
 # PIN AKSES GoAPI - biar nggak sembarang orang yang buka app ini bisa
 # manggil API (yang notabene kamu bayar) tanpa izin kamu dulu.
+#
+# PIN-nya DIISI LEWAT STREAMLIT SECRETS (panel web Streamlit Cloud), BUKAN
+# ditulis langsung di kode ini - soalnya kode ini ada di GitHub, kalau
+# repo-nya public (atau suatu saat di-publicin), siapa pun bisa lihat PIN-nya
+# kalau ditulis di sini. Cara isi: buka app kamu di Streamlit Cloud > titik
+# tiga > Settings > Secrets, tambahkan baris:
+#   GOAPI_ACCESS_PIN = "080603"
+# (ganti "080603" sesuka kamu). Simpan, app auto-restart, PIN langsung aktif.
 # =========================================================================
-GOAPI_ACCESS_PIN = "080603"
+try:
+    GOAPI_ACCESS_PIN = st.secrets.get("GOAPI_ACCESS_PIN")
+except Exception:
+    GOAPI_ACCESS_PIN = None
 
 if "goapi_unlocked" not in st.session_state:
     st.session_state.goapi_unlocked = False
 
-if goapi_configured and not st.session_state.goapi_unlocked:
+if goapi_configured and GOAPI_ACCESS_PIN and not st.session_state.goapi_unlocked:
     with st.sidebar.expander("🔒 PIN Akses Broker Summary (GoAPI)", expanded=False):
         _pin_input = st.text_input(
             "Masukkan PIN buat buka fitur Broker Summary:", type="password", key="goapi_pin_input",
@@ -721,11 +732,16 @@ if goapi_configured and not st.session_state.goapi_unlocked:
                 st.success("✅ PIN benar - fitur Broker Summary terbuka.")
             else:
                 st.error("❌ PIN salah.")
+elif goapi_configured and not GOAPI_ACCESS_PIN:
+    st.sidebar.caption(
+        "⚠️ PIN akses Broker Summary belum di-set (tambahin GOAPI_ACCESS_PIN "
+        "di Streamlit Secrets) - fitur ini masih kebuka buat siapa aja yang buka web ini."
+    )
 
 # goapi_configured yang dipakai di seluruh app SEKARANG juga mensyaratkan
-# PIN udah benar - kalau belum, semua toggle Broker Summary tetap disabled
-# walaupun API key-nya udah keisi.
-goapi_configured = goapi_configured and st.session_state.goapi_unlocked
+# PIN udah benar (KALAU PIN-nya di-set) - kalau belum, semua toggle Broker
+# Summary tetap disabled walaupun API key-nya udah keisi.
+goapi_configured = goapi_configured and (not GOAPI_ACCESS_PIN or st.session_state.goapi_unlocked)
 
 include_bandarmology = False  # Broker Summary (GoAPI) SENGAJA dimatikan buat mode Screening
                                # Massal - biar kuota API nggak kepakai per-saham x puluhan
