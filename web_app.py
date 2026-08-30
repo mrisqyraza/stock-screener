@@ -688,7 +688,7 @@ include_news = st.sidebar.checkbox(
     "📰 Sertakan Sentimen Berita (penguat fundamental)",
     value=True,
     help="Cek berita terkini (maks 31 hari) soal emiten. Pakai analisis AI kalau API "
-         "key sudah diisi di stock_screener.py, kalau belum fallback ke keyword matching. "
+         "key sudah diisi di Streamlit Secrets, kalau belum fallback ke keyword matching. "
          "Link berita selalu disertakan buat verifikasi manual.",
 )
 
@@ -752,7 +752,7 @@ st.sidebar.caption(
     "📡 Broker Summary (GoAPI) nggak tersedia di mode ini biar kuota API nggak boros "
     "kalau nge-scan banyak saham sekaligus. Buka bagian **'🔎 Screening Satu Saham'** "
     "di bawah kalau mau lihat data broker summary lengkap + validasinya per saham."
-    + ("" if "ISI_" not in GOAPI_API_KEY and bool(GOAPI_API_KEY) else " (API key GoAPI juga belum diisi di stock_screener.py.)")
+    + ("" if "ISI_" not in GOAPI_API_KEY and bool(GOAPI_API_KEY) else " (API key GoAPI juga belum diisi di Streamlit Secrets.)")
 )
 
 run_button = st.sidebar.button("🔍 Jalankan Screening", type="primary", width='stretch')
@@ -1083,7 +1083,7 @@ include_bandarmology_single = single_col_a.checkbox(
     "📡 Sertakan Broker Summary (GoAPI)", value=goapi_configured, disabled=not goapi_configured,
     help="Data broker net-buy/sell REAL dari GoAPI.IO buat SATU saham ini aja. Kalau "
          "saham ini SUDAH pernah di-cek hari ini, datanya dipakai dari cache (nggak "
-         "manggil API lagi) biar kuota hemat. " + ("Isi GOAPI_API_KEY di stock_screener.py dulu."
+         "manggil API lagi) biar kuota hemat. " + ("Isi GOAPI_API_KEY di Streamlit Secrets dulu."
          if not goapi_configured else "API key terdeteksi."),
 )
 include_buy_the_dip_single = single_col_b.checkbox(
@@ -1093,7 +1093,7 @@ include_buy_the_dip_single = single_col_b.checkbox(
          "jadi maksimal +1x panggilan API doang - atau 0x kalau nggak ada hari merah sama sekali.",
 )
 if not goapi_configured:
-    st.caption("⚠️ GOAPI_API_KEY belum diisi di stock_screener.py, atau PIN akses belum dimasukkan/benar - Broker Summary nggak akan jalan.")
+    st.caption("⚠️ GOAPI_API_KEY belum diisi di Streamlit Secrets, atau PIN akses belum dimasukkan/benar - Broker Summary nggak akan jalan.")
 else:
     _calls_today = _count_goapi_calls_today()
     st.caption(
