@@ -1257,7 +1257,7 @@ def compute_sentiment_score(ticker: str) -> dict:
 
 # Isi API key GoAPI kamu di sini (JANGAN taruh di kode yang di-push ke
 # GitHub public - pakai environment variable / Streamlit Secrets).
-GOAPI_API_KEY = "7d17369f-0eff-5e4f-9440-c5c28b92"
+GOAPI_API_KEY = "ISI_API_KEY_GOAPI_KAMU"
 GOAPI_BASE_URL = "https://api.goapi.io/stock/idx"
 
 # Referensi klasifikasi broker (dari riset manual, bisa berubah - cek ulang berkala)
@@ -1489,7 +1489,9 @@ def check_broker_accumulation(symbol: str, date: str = None) -> dict:
         "date": date,
         "description": BROKER_SUMMARY_DESCRIPTION,
         "top_buyer": top_buyer_code,
+        "top_buyer_value": round(float(top_buyer_val), 0),
         "top_seller": top_seller_code,
+        "top_seller_value": round(float(top_seller_val), 0),
         "is_smart_money_buying": is_smart_money_buying,
         "is_retail_selling": is_retail_selling,
         "raw_table": raw_table,
@@ -1500,25 +1502,22 @@ def check_broker_accumulation(symbol: str, date: str = None) -> dict:
 
 
 BUY_THE_DIP_DESCRIPTION = (
-    "Cek apakah dalam 30 hari terakhir ada broker smart money net-buy "
-    "BESAR justru pas harga saham lagi turun tajam (>=1% dalam sehari). Pola "
-    "ini sering diartikan sebagai 'buy the dip' institusi - mereka manfaatin "
-    "harga turun buat masuk lebih murah, bukan ikut panic-sell. INGAT: fungsi "
-    "ini manggil API GoAPI sekali per hari yang harganya turun dalam 30 hari "
-    "terakhir (bisa belasan kali kalau bulan itu banyak hari merah), jadi "
-    "CUKUP BOROS KUOTA - makanya cuma tersedia di mode Screening Satu Saham, "
-    "dan sebaiknya dipakai sesekali, bukan tiap kali screening."
+    "Cek apakah broker smart money net-buy BESAR justru pas harga saham lagi "
+    "turun tajam (>=1% dalam sehari). Pola ini sering diartikan sebagai 'buy "
+    "the dip' institusi - mereka manfaatin harga turun buat masuk lebih "
+    "murah, bukan ikut panic-sell. HEMAT KUOTA: fungsi ini cuma cek 1 HARI "
+    "MERAH PALING BARU dalam 30 hari terakhir (bukan semua hari merah), jadi "
+    "cuma 1x panggilan API per pengecekan - atau 0x kalau nggak ada hari "
+    "yang harganya turun tajam sama sekali dalam periode itu."
 )
 
 
 def check_buy_the_dip_accumulation(df: pd.DataFrame, symbol: str, lookback_days: int = 30) -> dict:
     """
-    Buy-the-dip saat broker akumulasi crash (Video 27) - cek beberapa hari
-    terakhir: apakah ada broker smart money net-buy besar JUSTRU pas harga
-    lagi turun tajam.
-
-    PERINGATAN KUOTA: fungsi ini manggil API sampai `lookback_days` kali
-    (satu per hari yang harganya turun) - lumayan boros kuota GoAPI.
+    Buy-the-dip saat broker akumulasi crash (Video 27) - HEMAT API: cuma
+    cek 1 hari merah PALING BARU dalam lookback_days (bukan tiap hari
+    merah), jadi cuma 1x panggilan API per pengecekan (atau 0x kalau nggak
+    ada hari yang harganya turun tajam sama sekali).
     """
     if len(df) < 2:
         return {"triggered": False, "value": "Data harga kurang", "description": BUY_THE_DIP_DESCRIPTION, "evidence": []}
@@ -1526,32 +1525,50 @@ def check_buy_the_dip_accumulation(df: pd.DataFrame, symbol: str, lookback_days:
     recent = df.tail(lookback_days)
     close = df["Close"]
 
-    accumulation_during_dip = []
-    checked_days = []
+    # Cari SEMUA hari merah dulu - ini GRATIS (dari data harga Yahoo Finance
+    # yang udah ke-fetch), belum manggil GoAPI sama sekali di tahap ini.
+    red_days = []
     for date in recent.index:
         idx = df.index.get_loc(date)
         if idx == 0:
             continue
         pct_change = (close.iloc[idx] / close.iloc[idx - 1] - 1) * 100
-        if pct_change >= -1:  # cuma cek hari yang harganya turun >=1%
-            continue
-        date_str = date.strftime("%Y-%m-%d")
-        acc = check_broker_accumulation(symbol, date_str)
-        checked_days.append({
-            "Tanggal": date_str,
-            "Perubahan Harga": f"{pct_change:+.1f}%",
-            "Net-Buyer Terbesar": acc.get("top_buyer", "-"),
-            "Smart Money Akumulasi?": "✅ Ya" if acc.get("is_smart_money_buying") else "❌ Tidak",
-        })
-        if acc.get("is_smart_money_buying"):
-            accumulation_during_dip.append((date_str, pct_change, acc["top_buyer"]))
+        if pct_change <= -1:  # turun >=1%
+            red_days.append((date, pct_change))
 
-    triggered = len(accumulation_during_dip) > 0
+    if not red_days:
+        return {
+            "triggered": False,
+            "value": f"Nggak ada hari yang harganya turun ≥1% dalam {lookback_days} hari terakhir - "
+                     f"nggak ada yang perlu dicek, 0 panggilan API dipakai.",
+            "description": BUY_THE_DIP_DESCRIPTION,
+            "evidence": [],
+        }
+
+    # Ambil yang PALING BARU aja - 1x panggilan API total, bukan per hari merah.
+    latest_date, latest_pct = red_days[-1]
+    date_str = latest_date.strftime("%Y-%m-%d")
+    acc = check_broker_accumulation(symbol, date_str)
+
+    checked_days = [{
+        "Tanggal": date_str,
+        "Perubahan Harga": f"{latest_pct:+.1f}%",
+        "Net-Buyer Terbesar": acc.get("top_buyer", "-"),
+        "Nilai Akumulasi (Rp)": f"Rp{acc.get('top_buyer_value', 0):,.0f}" if acc.get("top_buyer") else "-",
+        "Smart Money Akumulasi?": "✅ Ya" if acc.get("is_smart_money_buying") else "❌ Tidak",
+    }]
+
+    triggered = bool(acc.get("is_smart_money_buying"))
     if triggered:
-        d, pct, broker = accumulation_during_dip[0]
-        detail = f"Tgl {d}: harga turun {pct:.1f}%, tapi broker smart money ({broker}) justru net-buy besar"
+        detail = (f"Tgl {date_str}: harga turun {latest_pct:.1f}%, tapi broker smart money "
+                  f"({acc.get('top_buyer')}) justru net-buy besar")
     else:
-        detail = "Nggak ada tanda akumulasi smart money pas harga turun dalam beberapa hari terakhir"
+        detail = (
+            f"Hari merah paling baru ({date_str}, {latest_pct:+.1f}%) dicek - nggak ada tanda "
+            f"akumulasi smart money. Catatan: cuma hari terbaru yang dicek buat hemat kuota "
+            f"(ada {len(red_days)} hari merah total dalam {lookback_days} hari terakhir, tapi "
+            f"cuma 1 yang dicek ke API)."
+        )
 
     return {
         "triggered": triggered,
@@ -1591,12 +1608,19 @@ def compute_bandarmology_score(ticker: str, df: pd.DataFrame, include_buy_the_di
             score += 1
             reasons.append(dip_result["value"])
 
+    # Hitung persis berapa kali GoAPI kepanggil di run ini - dipakai buat
+    # ngelacak kuota harian di sisi web app (bukan tebakan/estimasi kasar).
+    api_calls_made = 1  # 1 panggilan buat check_broker_accumulation di atas
+    if dip_result is not None:
+        api_calls_made += len(dip_result.get("evidence") or [])
+
     return {
         "score": score,
         "reasons": reasons,
         "available": True,
         "broker_accumulation": acc,
         "buy_the_dip": dip_result,
+        "api_calls_made": api_calls_made,
     }
 
 
