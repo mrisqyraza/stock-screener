@@ -512,7 +512,7 @@ if _hero_b64:
             background-image: url("data:image/jpeg;base64,{_hero_b64}");
             background-size: cover;
             background-position: center;
-            min-height: 280px;
+            min-height: 340px;
             display: flex;
             align-items: center;
             padding: 0 2.4rem;
