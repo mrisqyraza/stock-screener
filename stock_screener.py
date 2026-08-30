@@ -983,7 +983,13 @@ INDICATOR_DESCRIPTIONS = {
 # MODUL FUNDAMENTAL & BERITA (analisis berita sebagai penguat fundamental+teknikal)
 # =========================================================================
 
-ANTHROPIC_API_KEY = "ISI_API_KEY_ANTHROPIC_KAMU_KALAU_MAU_ANALISIS_AI"
+# Sama kayak GOAPI_API_KEY di bawah - isi lewat Streamlit Secrets
+# (GOAPI_API_KEY / ANTHROPIC_API_KEY), jangan ditulis langsung di sini.
+try:
+    import streamlit as _st
+    ANTHROPIC_API_KEY = _st.secrets.get("ANTHROPIC_API_KEY", "ISI_API_KEY_ANTHROPIC_KAMU_KALAU_MAU_ANALISIS_AI")
+except Exception:
+    ANTHROPIC_API_KEY = "ISI_API_KEY_ANTHROPIC_KAMU_KALAU_MAU_ANALISIS_AI"
 ANTHROPIC_MODEL = "claude-sonnet-4-6"
 
 NEWS_MAX_AGE_DAYS = 31
@@ -1255,9 +1261,22 @@ def compute_sentiment_score(ticker: str) -> dict:
 # cepat habis (apalagi kalau masih paket Free Trial). Makanya modul ini
 # HARUS diaktifkan manual lewat toggle, defaultnya OFF.
 
-# Isi API key GoAPI kamu di sini (JANGAN taruh di kode yang di-push ke
-# GitHub public - pakai environment variable / Streamlit Secrets).
-GOAPI_API_KEY = "ISI_API_KEY_GOAPI_KAMU"
+# Isi API key GoAPI kamu di STREAMLIT SECRETS (panel web Streamlit Cloud),
+# BUKAN ditulis langsung di baris ini - soalnya file ini ada di GitHub,
+# kalau repo-nya public siapa pun bisa lihat key-nya kalau ditulis di sini.
+# Cara isi: buka app kamu di Streamlit Cloud > titik tiga > Settings >
+# Secrets, tambahkan baris:
+#   GOAPI_API_KEY = "key_asli_kamu_dari_goapi.io"
+# Kalau belum di-set di Secrets, fallback ke placeholder di bawah (otomatis
+# kedeteksi sebagai "belum dikonfigurasi" oleh app, fitur broker summary
+# nonaktif tapi app tetap jalan normal).
+try:
+    import streamlit as _st
+    GOAPI_API_KEY = _st.secrets.get("GOAPI_API_KEY", "ISI_API_KEY_GOAPI_KAMU")
+except Exception:
+    # Modul ini dijalankan di luar Streamlit (mis. script/testing biasa) -
+    # nggak ada st.secrets, fallback ke placeholder.
+    GOAPI_API_KEY = "ISI_API_KEY_GOAPI_KAMU"
 GOAPI_BASE_URL = "https://api.goapi.io/stock/idx"
 
 # Referensi klasifikasi broker (dari riset manual, bisa berubah - cek ulang berkala)
