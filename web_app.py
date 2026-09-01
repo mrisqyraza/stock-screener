@@ -50,7 +50,38 @@ from stock_screener import (
     BROKER_SMART_MONEY,
     BROKER_RETAIL,
     BROKER_INSIDER_MAP,
+    get_delisted_tickers,
+    mark_ticker_delisted,
+    unmark_ticker_delisted,
+    check_yfinance_backend,
+    BATCH_SIZE,
+    BATCH_DELAY_SECONDS,
+    BATCH_MAX_RETRIES,
 )
+
+# =========================================================================
+# CACHE HASIL DOWNLOAD (st.cache_data) - biar nggak fetch ulang ke yfinance
+# tiap kali app di-reload/rerun atau tombol screening diklik ulang dalam
+# rentang waktu yang sama. Data harga saham nggak berubah tiap detik, jadi
+# aman di-cache per jam. Ini murni WRAPPER di atas fetch_batch_data()/
+# fetch_data() yang udah ada di stock_screener.py - fungsi aslinya nggak
+# diubah/diganti sama sekali, tetap bisa dipanggil langsung kalau perlu.
+# =========================================================================
+CACHE_TTL_SECONDS = 3600  # 1 jam - cukup buat data harian delay 15-20 menit
+
+
+@st.cache_data(ttl=CACHE_TTL_SECONDS, show_spinner=False)
+def _cached_fetch_batch_data(tickers_tuple: tuple, _cache_date: str):
+    """Versi ter-cache dari fetch_batch_data(). `_cache_date` cuma dipakai
+    biar cache otomatis basi/reset tiap ganti hari (data 3mo bakal beda)."""
+    return fetch_batch_data(list(tickers_tuple))
+
+
+@st.cache_data(ttl=CACHE_TTL_SECONDS, show_spinner=False)
+def _cached_fetch_data(ticker: str, _cache_date: str):
+    """Versi ter-cache dari fetch_data() - dipakai di mode Screening Satu Saham."""
+    return fetch_data(ticker)
+
 
 # Indikator SKOR tambahan (di luar 3 screener utama) yang bisa dipilih user.
 AVAILABLE_INDICATORS = {
@@ -648,6 +679,55 @@ st.sidebar.header("⚙️ Pengaturan")
 
 st.sidebar.caption("Mode: Semua saham IDX (~900+) - watchlist bawaan (LQ45 + konglomerat) udah dihapus.")
 
+# =========================================================================
+# DIAGNOSTIK KONEKSI YFINANCE - cek sekali per sesi apakah curl_cffi
+# (browser TLS impersonation) aktif. Ini cuma info, nggak ngubah cara
+# fetch bekerja - yfinance versi ini otomatis pakai curl_cffi sendiri
+# kalau library-nya ke-install (sudah ada di requirements.txt).
+# =========================================================================
+if "yf_backend_info" not in st.session_state:
+    st.session_state.yf_backend_info = check_yfinance_backend()
+_backend_info = st.session_state.yf_backend_info
+_backend_icon = "🟢" if _backend_info.get("curl_cffi_aktif") else "🟡"
+with st.sidebar.expander(f"{_backend_icon} Status Koneksi yfinance", expanded=False):
+    st.caption(_backend_info.get("keterangan", "-"))
+    st.caption(
+        f"Batch: {BATCH_SIZE} ticker/batch, jeda {BATCH_DELAY_SECONDS}s antar batch, "
+        f"retry {BATCH_MAX_RETRIES}x kalau batch kosong total. Hasil download di-cache "
+        f"{CACHE_TTL_SECONDS // 60} menit biar nggak fetch ulang ke Yahoo Finance kalau "
+        "klik screening berkali-kali."
+    )
+
+# =========================================================================
+# PANEL SAHAM DELISTED - saham yang gagal ambil data 3x berturut-turut
+# (kemungkinan delisted/suspend) otomatis masuk sini dan DILEWATIN di
+# screening berikutnya (nggak di-hit ke yfinance lagi). Bisa juga ditandai
+# manual, atau dihapus lagi kalau ternyata salah tandai.
+# =========================================================================
+_delisted_map = get_delisted_tickers()
+with st.sidebar.expander(f"🚫 Saham Delisted ({len(_delisted_map)})", expanded=False):
+    st.caption(
+        "Ticker di sini dilewati otomatis pas screening - nggak di-hit ke yfinance "
+        "lagi, biar nggak buang kuota request & nggak numpuk error 'possibly delisted' "
+        "di log."
+    )
+    if _delisted_map:
+        for _t, _info in sorted(_delisted_map.items()):
+            _c1, _c2 = st.columns([4, 1])
+            _c1.caption(f"**{_t}** — {_info.get('alasan', '-')} ({_info.get('tanggal_ditandai', '-')})")
+            if _c2.button("↩️", key=f"unmark_{_t}", help="Hapus tanda delisted (cek ulang lagi)"):
+                unmark_ticker_delisted(_t)
+                st.rerun()
+    else:
+        st.caption("Belum ada saham yang ditandai delisted.")
+
+    st.markdown("---")
+    _manual_ticker = st.text_input("Tandai manual (contoh: ABCD.JK):", key="manual_delist_input")
+    if st.button("🚫 Tandai Delisted", key="manual_delist_btn") and _manual_ticker.strip():
+        mark_ticker_delisted(_manual_ticker.strip().upper(), reason="Ditandai manual dari web app")
+        st.success(f"{_manual_ticker.strip().upper()} ditandai delisted.")
+        st.rerun()
+
 st.sidebar.markdown("---")
 st.sidebar.subheader("🎯 Pilih Screener")
 st.sidebar.caption(
@@ -803,6 +883,14 @@ if run_button:
         st.error("Gagal mengambil daftar saham IDX. Cek koneksi internet, atau coba lagi nanti.")
         st.stop()
 
+    _delisted_before_run = get_delisted_tickers()
+    _skipped_count = sum(1 for t in watchlist if t in _delisted_before_run)
+    if _skipped_count:
+        st.caption(
+            f"ℹ️ {_skipped_count} saham dilewati (sudah ditandai delisted) - lihat panel "
+            "'🚫 Saham Delisted' di sidebar."
+        )
+
     results = []
     evidence_map = {}
     indicators_map = {}
@@ -819,7 +907,7 @@ if run_button:
             (b + 1) / total_batches,
             text=f"Memproses batch {b + 1}/{total_batches} ({len(batch)} saham)...",
         )
-        batch_data = fetch_batch_data(batch)
+        batch_data = _cached_fetch_batch_data(tuple(batch), _today_str())
 
         for ticker, df in batch_data.items():
             screeners = compute_screener_results(df)
@@ -992,7 +1080,7 @@ if st.session_state.results is not None:
                                 for t in members if t in st.session_state.chart_data}
                 missing = [t for t in members if t not in group_batch]
                 if missing:
-                    group_batch.update(fetch_batch_data(missing))
+                    group_batch.update(_cached_fetch_batch_data(tuple(missing), _today_str()))
             ll = check_leading_lagging(pilihan_ticker, group_batch)
             if ll["triggered"]:
                 st.info(f"🔗 **Leading-Lagging**: {ll['value']}")
@@ -1190,7 +1278,7 @@ if single_cek_button and single_ticker_input:
         ticker_full += ".JK"
 
     with st.spinner(f"Menganalisis {ticker_full}..."):
-        df_single = fetch_data(ticker_full)
+        df_single = _cached_fetch_data(ticker_full, _today_str())
 
         if df_single.empty:
             st.session_state.single_result = {"found": False, "ticker": ticker_full}
@@ -1238,7 +1326,7 @@ if single_cek_button and single_ticker_input:
             ll_single = None
             for gname, members in KONGLOMERAT_GROUPS.items():
                 if ticker_full in members:
-                    group_batch_single = fetch_batch_data(members)
+                    group_batch_single = _cached_fetch_batch_data(tuple(members), _today_str())
                     ll_single = check_leading_lagging(ticker_full, group_batch_single)
                     break
 
