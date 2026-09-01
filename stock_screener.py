@@ -907,6 +907,49 @@ def compute_trade_levels(df: pd.DataFrame) -> dict:
     }
 
 
+def compute_position_sizing(modal_total: float, risk_pct: float, trade_levels: dict) -> dict:
+    """
+    Position sizing pakai aturan risiko-per-trade (mis. 2% rule) - hitung
+    berapa lot maksimal yang boleh dibeli berdasarkan modal & toleransi
+    risiko, plus strategi entry bertahap 2-3-5 (masuk sedikit dulu,
+    tambah kalau konfirmasi, sisa jadi cadangan).
+
+    modal_total: total modal trading (Rp)
+    risk_pct: berapa persen dari modal yang rela di-resiko-kan PER TRADE
+              (bukan per saham beli habis) - lazimnya 1-2%.
+    trade_levels: hasil dari compute_trade_levels(), butuh "price" & "stop_loss"
+    """
+    price = trade_levels["price"]
+    stop_loss = trade_levels["stop_loss"]
+    jarak_cutloss_pct = (price - stop_loss) / price * 100 if price > 0 else 0
+
+    risiko_rp = modal_total * (risk_pct / 100)
+    max_position_rp = risiko_rp / (jarak_cutloss_pct / 100) if jarak_cutloss_pct > 0 else 0
+    # 1 lot = 100 lembar saham di IDX
+    max_lot = int(max_position_rp / (price * 100)) if price > 0 else 0
+    max_lot = max(max_lot, 0)
+
+    plan_2_3_5 = {
+        "entry_awal_20pct": {"lot": max(round(max_lot * 0.2), 1) if max_lot > 0 else 0, "porsi": "20%"},
+        "konfirmasi_30pct": {"lot": max(round(max_lot * 0.3), 0) if max_lot > 0 else 0, "porsi": "30%"},
+        "cadangan_50pct":   {"lot": max(round(max_lot * 0.5), 0) if max_lot > 0 else 0, "porsi": "50%"},
+    }
+
+    actual_position_rp = max_lot * price * 100
+    return {
+        "modal_total": modal_total,
+        "risk_pct": risk_pct,
+        "jarak_cutloss_pct": round(float(jarak_cutloss_pct), 2),
+        "risiko_rp": round(float(risiko_rp), 0),
+        "max_position_rp": round(float(max_position_rp), 0),
+        "max_lot": max_lot,
+        "actual_position_rp": round(float(actual_position_rp), 0),
+        "plan_2_3_5": plan_2_3_5,
+        "pct_of_modal": round(float(actual_position_rp / modal_total * 100), 1) if modal_total else 0,
+        "too_risky": max_lot == 0,
+    }
+
+
 # Deskripsi tiap indikator dalam bahasa sederhana, dipakai di web app.
 INDICATOR_DESCRIPTIONS = {
     "rsi_oversold": (
@@ -1230,7 +1273,137 @@ def compute_fundamental_score(ticker: str) -> dict:
     }
 
 
-def compute_sentiment_score(ticker: str) -> dict:
+def compute_fundamental_health_score(ticker: str) -> dict:
+    """
+    Skor kesehatan fundamental SUNGGUHAN - beda dari compute_fundamental_score()
+    di atas yang isinya cuma sentimen berita. Ini pakai rasio keuangan asli:
+    PER, PBV, DER, ROA, dan profitabilitas net income - ditarik dari
+    yfinance .info (gratis, sumber sama yang udah dipakai buat harga).
+
+    Melengkapi pilar ke-4 (Fundamental) yang sebelumnya kosong di screener
+    ini - sebelumnya cuma ada 3 pilar (Teknikal, Money Flow, Sentimen).
+    """
+    try:
+        info = yf.Ticker(ticker).info
+    except Exception as e:
+        return {"available": False, "error": str(e), "score": 0, "max_score": 5, "checks": {}}
+
+    if not info or info.get("regularMarketPrice") is None:
+        return {"available": False, "error": "Data fundamental tidak ditemukan", "score": 0, "max_score": 5, "checks": {}}
+
+    per = info.get("trailingPE")
+    pbv = info.get("priceToBook")
+    der = info.get("debtToEquity")
+    roa = info.get("returnOnAssets")
+    net_income = info.get("netIncomeToCommon")
+
+    checks = {
+        "profitable": {
+            "passed": net_income is not None and net_income > 0,
+            "label": "Perusahaan profit (net income positif)",
+            "value": f"Rp{net_income:,.0f}" if net_income is not None else "Data tidak tersedia",
+        },
+        "per_wajar": {
+            "passed": per is not None and 0 < per <= 20,
+            "label": "PER wajar (0-20x, hindari yang kemahalan)",
+            "value": f"{per:.1f}x" if per is not None else "Data tidak tersedia",
+        },
+        "pbv_sehat": {
+            "passed": pbv is not None and pbv > 0.5,
+            "label": "PBV sehat (>0.5x, PBV kelewat rendah bisa jadi red flag)",
+            "value": f"{pbv:.2f}x" if pbv is not None else "Data tidak tersedia",
+        },
+        "der_rendah": {
+            "passed": der is not None and der < 100,
+            "label": "DER rendah (<100%, utang nggak kebesaran vs ekuitas)",
+            "value": f"{der:.1f}%" if der is not None else "Data tidak tersedia",
+        },
+        "roa_positif": {
+            "passed": roa is not None and roa > 0,
+            "label": "ROA positif (aset perusahaan menghasilkan laba)",
+            "value": f"{roa*100:.1f}%" if roa is not None else "Data tidak tersedia",
+        },
+    }
+    score = sum(1 for c in checks.values() if c["passed"])
+
+    return {
+        "available": True,
+        "score": score,
+        "max_score": len(checks),
+        "checks": checks,
+        "per": per, "pbv": pbv, "der": der, "roa": roa, "net_income": net_income,
+        "summary": f"{score}/{len(checks)} kriteria fundamental terpenuhi",
+    }
+
+def compute_dcf_fair_value(ticker: str, growth1: float = 0.10, growth2: float = 0.05,
+                            discount: float = 0.10, terminal: float = 0.03) -> dict:
+    """
+    DCF (Discounted Cash Flow) 2-tahap sederhana - struktur & urutan
+    perhitungannya sama kayak kalkulator DCF manual: FCF sekarang ->
+    proyeksi growth tahap 1 (5 tahun) -> growth tahap 2 (5 tahun
+    berikutnya) -> terminal value -> present value semuanya -> kurangi
+    net debt -> bagi jumlah saham beredar -> harga wajar per saham.
+
+    Default growth1=10%, growth2=5%, discount=10%, terminal=3% - ini
+    ASUMSI, bukan angka pasti. Ganti sesuai keyakinan kamu sendiri soal
+    prospek perusahaannya - hasil DCF sangat sensitif ke angka-angka ini.
+    """
+    try:
+        info = yf.Ticker(ticker).info
+    except Exception as e:
+        return {"available": False, "error": str(e)}
+
+    fcf = info.get("freeCashflow")
+    total_debt = info.get("totalDebt") or 0
+    total_cash = info.get("totalCash") or 0
+    net_debt = total_debt - total_cash
+    shares = info.get("sharesOutstanding")
+    current_price = info.get("currentPrice") or info.get("regularMarketPrice")
+
+    if not fcf or not shares:
+        return {
+            "available": False,
+            "error": "Data Free Cash Flow atau jumlah saham beredar nggak tersedia dari Yahoo "
+                     "Finance buat saham ini - DCF nggak bisa dihitung otomatis.",
+        }
+
+    pv_total = 0.0
+    cf = fcf
+    for yr in range(1, 11):
+        g = growth1 if yr <= 5 else growth2
+        cf = cf * (1 + g)
+        pv_total += cf / (1 + discount) ** yr
+
+    if discount <= terminal:
+        return {"available": False, "error": "Discount rate harus lebih besar dari terminal growth rate."}
+
+    terminal_value = (cf * (1 + terminal)) / (discount - terminal)
+    pv_terminal = terminal_value / (1 + discount) ** 10
+    equity_value = pv_total + pv_terminal - net_debt
+    fair_value = equity_value / shares
+
+    mos_pct = ((fair_value - current_price) / fair_value * 100) if (fair_value and current_price) else None
+    harga_beli_ideal = fair_value * (1 - 0.30) if fair_value else None  # target MOS 30%, umum dipakai
+
+    return {
+        "available": True,
+        "fcf_now": fcf,
+        "net_debt": net_debt,
+        "shares_outstanding": shares,
+        "fair_value": round(float(fair_value), 0) if fair_value else None,
+        "current_price": current_price,
+        "mos_pct": round(float(mos_pct), 1) if mos_pct is not None else None,
+        "harga_beli_ideal_mos30": round(float(harga_beli_ideal), 0) if harga_beli_ideal else None,
+        "assumptions": {"growth1": growth1, "growth2": growth2, "discount": discount, "terminal": terminal},
+        "note": (
+            "DCF sensitif banget ke asumsi growth rate & discount rate - anggap ini SALAH SATU "
+            "sudut pandang valuasi, bukan angka pasti. Selalu bandingkan juga sama PER/PBV dan "
+            "kondisi bisnis riil perusahaannya."
+        ),
+    }
+
+
+
     """
     Placeholder terpisah buat sentimen sosial media (beda dari berita resmi).
     Belum diimplementasi - butuh data platform sosial media yang biasanya
@@ -1520,6 +1693,89 @@ def check_broker_accumulation(symbol: str, date: str = None) -> dict:
     }
 
 
+BROKER_AVERAGING_DESCRIPTION = (
+    "Cek broker tertentu (biasanya top buyer dari Broker Summary) apakah lagi "
+    "'averaging UP' (harga rata-rata beli mereka naik dari hari ke hari - "
+    "sinyal makin yakin/makin agresif akumulasi) atau 'averaging DOWN' (harga "
+    "rata-rata beli turun - kurang meyakinkan, bisa jadi cuma nyoba-nyoba). "
+    "PERINGATAN KUOTA: fungsi ini manggil API sebanyak jumlah hari yang dicek "
+    "(default 5 hari) - jauh lebih boros dari pengecekan Broker Summary biasa, "
+    "makanya ini OPSIONAL dan terpisah, bukan otomatis jalan tiap screening."
+)
+
+
+def check_broker_averaging_trend(symbol: str, broker_code: str, lookback_days: int = 5) -> dict:
+    """
+    Cek apakah broker tertentu sedang averaging UP (sinyal positif lebih
+    kuat - makin yakin, makin agresif) atau averaging DOWN (kurang
+    meyakinkan) selama beberapa hari terakhir, berdasarkan data harian
+    broker summary dari GoAPI.
+
+    PERINGATAN KUOTA: manggil API sebanyak `lookback_days` kali (default 5).
+    Pakai secukupnya, jangan dipanggil otomatis buat semua saham sekaligus.
+    """
+    dates_checked = []
+    avg_prices = []
+    lots = []
+
+    for i in range(lookback_days):
+        d = (datetime.now() - pd.Timedelta(days=i)).strftime("%Y-%m-%d")
+        rows = fetch_broker_summary(symbol, d)
+        if not rows:
+            continue
+        buy_rows = [
+            r for r in rows
+            if (r.get("code") == broker_code) and str(r.get("side", "")).lower() in ("buy", "b")
+        ]
+        if not buy_rows:
+            continue
+        total_val = sum((r.get("value") or 0) for r in buy_rows)
+        total_lot = sum((r.get("lot") or 0) for r in buy_rows)
+        if total_lot > 0:
+            dates_checked.append(d)
+            avg_prices.append(total_val / total_lot)
+            lots.append(total_lot)
+
+    # urutkan dari yang paling lama ke paling baru (kronologis)
+    combined = sorted(zip(dates_checked, avg_prices, lots), key=lambda x: x[0])
+    dates_checked = [c[0] for c in combined]
+    avg_prices = [c[1] for c in combined]
+    lots = [c[2] for c in combined]
+
+    if len(avg_prices) < 2:
+        return {
+            "available": True,
+            "trend": "data_kurang",
+            "accumulation_count": len(avg_prices),
+            "meets_min_count": False,
+            "signal": "belum_cukup_data",
+            "description": BROKER_AVERAGING_DESCRIPTION,
+            "detail": f"Broker {broker_code} cuma kedeteksi net-buy di {len(avg_prices)} dari "
+                      f"{lookback_days} hari terakhir - belum cukup buat nentuin tren averaging.",
+            "dates": dates_checked, "avg_prices": avg_prices,
+        }
+
+    is_averaging_up = avg_prices[-1] > avg_prices[0]
+    meets_min_count = len(avg_prices) >= 2  # syarat minimal akumulasi 2x
+
+    signal = "positif_kuat" if (is_averaging_up and meets_min_count) else "kurang_menarik"
+    trend_label = "averaging UP" if is_averaging_up else "averaging DOWN"
+
+    return {
+        "available": True,
+        "trend": "averaging_up" if is_averaging_up else "averaging_down",
+        "accumulation_count": len(avg_prices),
+        "meets_min_count": meets_min_count,
+        "signal": signal,
+        "description": BROKER_AVERAGING_DESCRIPTION,
+        "detail": (
+            f"Broker {broker_code} {trend_label} selama {len(avg_prices)} hari yang "
+            f"kedeteksi ({dates_checked[0]} s/d {dates_checked[-1]}): harga rata-rata beli "
+            f"dari Rp{avg_prices[0]:,.0f} jadi Rp{avg_prices[-1]:,.0f}."
+        ),
+        "dates": dates_checked, "avg_prices": [round(float(p), 0) for p in avg_prices], "lots": lots,
+    }
+
 BUY_THE_DIP_DESCRIPTION = (
     "Cek apakah broker smart money net-buy BESAR justru pas harga saham lagi "
     "turun tajam (>=1% dalam sehari). Pola ini sering diartikan sebagai 'buy "
@@ -1597,7 +1853,51 @@ def check_buy_the_dip_accumulation(df: pd.DataFrame, symbol: str, lookback_days:
     }
 
 
-def compute_bandarmology_score(ticker: str, df: pd.DataFrame, include_buy_the_dip: bool = False) -> dict:
+def check_entry_conditions(price_above_ma50: bool, fundamental_score: int, fundamental_max: int,
+                            bandarmology_triggered: bool, risk_reward_1: float = None) -> dict:
+    """
+    Checklist 4-kondisi wajib sebelum entry - rangkum sinyal dari 4 pilar
+    sekaligus (Teknikal, Fundamental, Money Flow/Bandarmology, Risk:Reward)
+    jadi satu checklist ringkas, bukan sinyal baru - ini cuma nge-gabungin
+    hasil dari fungsi-fungsi lain yang udah ada.
+
+    Semua parameter dihitung DI LUAR fungsi ini (di web_app.py) dari hasil
+    compute_trade_levels, compute_fundamental_health_score, dan
+    compute_bandarmology_score / check_broker_accumulation yang udah jalan.
+    """
+    fundamental_ok = fundamental_max > 0 and (fundamental_score / fundamental_max) >= 0.6  # minimal 60% kriteria fundamental lolos
+    rr_ok = (risk_reward_1 or 0) >= 2
+
+    conditions = {
+        "trend": {
+            "passed": bool(price_above_ma50),
+            "label": "Trend: harga di atas MA50 (bukan downtrend)",
+        },
+        "fundamental": {
+            "passed": bool(fundamental_ok),
+            "label": f"Fundamental: minimal 60% kriteria sehat terpenuhi ({fundamental_score}/{fundamental_max})",
+        },
+        "bandarmology": {
+            "passed": bool(bandarmology_triggered),
+            "label": "Money Flow: ada tanda akumulasi smart money",
+        },
+        "risk_reward": {
+            "passed": bool(rr_ok),
+            "label": f"Risk:Reward minimal 1:2 ke TP1 ({risk_reward_1 if risk_reward_1 else '-'})",
+        },
+    }
+    met_count = sum(1 for c in conditions.values() if c["passed"])
+
+    return {
+        "conditions": conditions,
+        "met_count": met_count,
+        "total": 4,
+        "all_met": met_count == 4,
+        "summary": f"{met_count}/4 kondisi wajib terpenuhi" + (" - siap entry" if met_count == 4 else ""),
+    }
+
+
+
     """
     Skor tambahan dari data broker summary GoAPI - OPSIONAL, cuma jalan
     kalau GOAPI_API_KEY udah diisi. Ini yang dipanggil dari web app / script
