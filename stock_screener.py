@@ -24,6 +24,8 @@ import ta
 import requests
 import time
 import io
+import os
+import json
 from datetime import datetime
 
 # =========================================================================
@@ -77,8 +79,110 @@ VOLUME_SPIKE_MULTIPLIER = 1.8   # volume hari ini vs rata-rata 20 hari
 LOOKBACK_DAYS = "3mo"
 
 # Ukuran batch buat download data sekaligus.
-BATCH_SIZE = 50
-BATCH_DELAY_SECONDS = 1.5  # jeda antar batch, biar "sopan" ke server
+# Diperkecil dari 50 -> 15 dan delay dinaikin, biar lebih "sopan" ke Yahoo
+# Finance dan ngurangin resiko kena rate limit (401 Invalid Crumb) yang
+# sering muncul kalau nge-hit banyak ticker sekaligus dari IP shared hosting
+# kayak Streamlit Cloud. Scan tetap MENYELURUH ke semua ticker di watchlist -
+# cuma dipecah jadi batch lebih kecil & lebih pelan, bukan dikurangin cakupannya.
+BATCH_SIZE = 15
+BATCH_DELAY_SECONDS = 3.0  # jeda antar batch
+BATCH_RETRY_DELAY_SECONDS = 8.0  # jeda ekstra sebelum retry kalau satu batch gagal total/kosong semua
+BATCH_MAX_RETRIES = 1  # berapa kali retry per batch kalau kena gagal total/kosong (bukan per-ticker gagal biasa)
+
+
+# =========================================================================
+# MODUL CACHE SAHAM DELISTED
+# =========================================================================
+# Tujuan: saham yang udah kebukti nggak ada datanya di Yahoo Finance (delisted/
+# suspend permanen) DITANDAI, disimpan permanen di file JSON, dan otomatis
+# DILEWATIN (nggak di-hit ke yfinance lagi) di screening-screening berikutnya.
+# Ini murni PENAMBAHAN di atas fetch_data()/fetch_batch_data() yang udah ada -
+# alur & hasil normalnya nggak berubah sama sekali buat ticker yang sehat.
+#
+# Kenapa nggak langsung ditandai delisted sekali gagal?
+# Karena gagal ambil data bisa juga gara-gara rate limit / gangguan sementara
+# dari Yahoo Finance (lihat pesan "Invalid Crumb" / HTTP 401 di log kamu),
+# BUKAN berarti sahamnya beneran delisted. Makanya baru ditandai PERMANEN
+# setelah gagal DELISTED_MISS_THRESHOLD kali berturut-turut (lintas beberapa
+# kali run screening), biar nggak salah tandai.
+# =========================================================================
+
+DELISTED_CACHE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "delisted_tickers.json")
+DELISTED_MISS_THRESHOLD = 3  # gagal berturut-turut sebanyak ini baru ditandai delisted otomatis
+
+
+def _load_delisted_store() -> dict:
+    if not os.path.exists(DELISTED_CACHE_FILE):
+        return {"delisted": {}, "miss_streak": {}}
+    try:
+        with open(DELISTED_CACHE_FILE, "r") as f:
+            data = json.load(f)
+        data.setdefault("delisted", {})
+        data.setdefault("miss_streak", {})
+        return data
+    except Exception as e:
+        print(f"[WARN] Gagal baca cache delisted ({DELISTED_CACHE_FILE}), mulai dari kosong: {e}")
+        return {"delisted": {}, "miss_streak": {}}
+
+
+def _save_delisted_store(data: dict):
+    try:
+        os.makedirs(os.path.dirname(DELISTED_CACHE_FILE), exist_ok=True)
+        with open(DELISTED_CACHE_FILE, "w") as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+    except Exception as e:
+        print(f"[WARN] Gagal simpan cache delisted: {e}")
+
+
+def get_delisted_tickers() -> dict:
+    """Balikin dict {ticker: {tanggal_ditandai, alasan}} - semua saham yang udah ditandai delisted."""
+    return _load_delisted_store()["delisted"]
+
+
+def is_ticker_delisted(ticker: str) -> bool:
+    return ticker in _load_delisted_store()["delisted"]
+
+
+def mark_ticker_delisted(ticker: str, reason: str = "Ditandai manual"):
+    """Tandai satu ticker sebagai delisted (misal manual dari UI web app)."""
+    data = _load_delisted_store()
+    data["delisted"][ticker] = {
+        "tanggal_ditandai": datetime.now().strftime("%Y-%m-%d"),
+        "alasan": reason,
+    }
+    data["miss_streak"].pop(ticker, None)
+    _save_delisted_store(data)
+
+
+def unmark_ticker_delisted(ticker: str):
+    """Hapus tanda delisted (misal ternyata salah tandai) - dicek lagi mulai screening berikutnya."""
+    data = _load_delisted_store()
+    data["delisted"].pop(ticker, None)
+    data["miss_streak"].pop(ticker, None)
+    _save_delisted_store(data)
+
+
+def _record_fetch_result(ticker: str, success: bool):
+    """Dipanggil tiap kali fetch_data()/fetch_batch_data() selesai proses SATU ticker.
+    Nge-track gagal berturut-turut, dan auto-tandai delisted kalau udah kelewat threshold."""
+    data = _load_delisted_store()
+    if success:
+        if ticker in data["miss_streak"]:
+            data["miss_streak"].pop(ticker, None)
+            _save_delisted_store(data)
+        return
+
+    streak = data["miss_streak"].get(ticker, 0) + 1
+    if streak >= DELISTED_MISS_THRESHOLD and ticker not in data["delisted"]:
+        data["delisted"][ticker] = {
+            "tanggal_ditandai": datetime.now().strftime("%Y-%m-%d"),
+            "alasan": f"Auto: gagal ambil data {streak}x berturut-turut (kemungkinan delisted/suspend)",
+        }
+        data["miss_streak"].pop(ticker, None)
+        print(f"[INFO] {ticker} ditandai DELISTED otomatis setelah {streak}x gagal berturut-turut.")
+    else:
+        data["miss_streak"][ticker] = streak
+    _save_delisted_store(data)
 
 
 # =========================================================================
@@ -86,6 +190,37 @@ BATCH_DELAY_SECONDS = 1.5  # jeda antar batch, biar "sopan" ke server
 # =========================================================================
 
 IDX_ALL_TICKERS_URL = "https://raw.githubusercontent.com/wildangunawan/Dataset-Saham-IDX/master/List%20Emiten/all.csv"
+
+
+def check_yfinance_backend() -> dict:
+    """
+    Cek apakah yfinance beneran lagi pakai curl_cffi (TLS/browser
+    impersonation) atau fallback ke requests biasa (lebih gampang kena
+    rate-limit/block dari Yahoo Finance). Murni buat diagnostik, dipanggil
+    sekali pas startup app - nggak ngubah cara fetch_data()/fetch_batch_data()
+    kerja, karena yfinance versi ini (>=1.x) OTOMATIS pakai curl_cffi sendiri
+    kalau library-nya kedetect terinstall - kita nggak perlu setting session
+    manual kayak versi lama.
+    """
+    try:
+        from yfinance import _http as _yf_http
+        active = bool(getattr(_yf_http, "HAS_CURL_CFFI", False))
+        return {
+            "curl_cffi_aktif": active,
+            "keterangan": (
+                "yfinance pakai curl_cffi dengan browser TLS impersonation (Chrome) - "
+                "konfigurasi paling tahan rate-limit."
+                if active else
+                "yfinance FALLBACK ke requests biasa (curl_cffi nggak kedetect) - lebih "
+                "rawan kena rate-limit/block dari Yahoo Finance. Cek curl_cffi ada di "
+                "requirements.txt dan ke-install dengan benar."
+            ),
+        }
+    except Exception as e:
+        return {
+            "curl_cffi_aktif": None,
+            "keterangan": f"Nggak bisa dicek (kemungkinan versi yfinance beda struktur internal): {e}",
+        }
 
 
 def fetch_all_idx_tickers(exclude_boards: list = None) -> list:
@@ -114,12 +249,32 @@ def fetch_all_idx_tickers(exclude_boards: list = None) -> list:
 
 def fetch_data(ticker: str) -> pd.DataFrame:
     """Ambil data OHLCV historis (delayed) dari Yahoo Finance - SATU ticker."""
+    if is_ticker_delisted(ticker):
+        # Udah ditandai delisted sebelumnya - nggak usah buang request ke yfinance lagi.
+        return pd.DataFrame()
+
     df = yf.download(ticker, period=LOOKBACK_DAYS, interval="1d", progress=False)
     if df.empty or len(df) < 30:
+        _record_fetch_result(ticker, success=False)
         return pd.DataFrame()
     if isinstance(df.columns, pd.MultiIndex):
         df.columns = df.columns.get_level_values(0)
+    _record_fetch_result(ticker, success=True)
     return df
+
+
+def _download_one_batch(batch: list):
+    """Satu kali percobaan download buat satu batch ticker. Dipisah dari
+    fetch_batch_data() biar bisa dipanggil ulang (retry) kalau gagal total."""
+    if len(batch) == 1:
+        raw = yf.download(batch[0], period=LOOKBACK_DAYS, interval="1d", progress=False)
+        return {batch[0]: raw}
+    raw = yf.download(
+        batch, period=LOOKBACK_DAYS, interval="1d",
+        group_by="ticker", progress=False, threads=True,
+    )
+    return {t: (raw[t] if t in raw.columns.get_level_values(0) else pd.DataFrame())
+            for t in batch}
 
 
 def fetch_batch_data(tickers: list, batch_size: int = None, delay: float = None) -> dict:
@@ -127,31 +282,50 @@ def fetch_batch_data(tickers: list, batch_size: int = None, delay: float = None)
     Ambil data OHLCV buat BANYAK ticker sekaligus, dipecah jadi batch kecil.
     Jauh lebih cepat daripada fetch_data() satu-satu, dan lebih aman dari
     resiko rate-limit karena requestnya nggak sekaligus semua.
+
+    Scan tetap MENYELURUH ke semua ticker yang dikasih (kecuali yang udah
+    ditandai delisted) - batch kecil & retry di sini cuma soal SEBERAPA HATI-HATI
+    cara ambilnya, bukan ngurangin cakupan saham yang di-screening.
     """
     batch_size = batch_size or BATCH_SIZE
     delay = delay if delay is not None else BATCH_DELAY_SECONDS
 
+    # Buang dulu ticker yang udah ditandai delisted - nggak usah dikirim ke
+    # yfinance sama sekali, biar kuota request nggak kebuang percuma.
+    delisted_now = get_delisted_tickers()
+    tickers_to_fetch = [t for t in tickers if t not in delisted_now]
+    skipped_delisted = len(tickers) - len(tickers_to_fetch)
+    if skipped_delisted:
+        print(f"[INFO] {skipped_delisted} ticker dilewati (sudah ditandai delisted): "
+              f"{', '.join(sorted(set(tickers) & set(delisted_now.keys())))}")
+
     result = {}
-    total_batches = (len(tickers) + batch_size - 1) // batch_size
+    total_batches = (len(tickers_to_fetch) + batch_size - 1) // batch_size
 
     for b in range(total_batches):
-        batch = tickers[b * batch_size: (b + 1) * batch_size]
+        batch = tickers_to_fetch[b * batch_size: (b + 1) * batch_size]
         print(f"[INFO] Batch {b + 1}/{total_batches} ({len(batch)} ticker)...")
 
-        try:
-            if len(batch) == 1:
-                raw = yf.download(batch[0], period=LOOKBACK_DAYS, interval="1d", progress=False)
-                candidates = {batch[0]: raw}
-            else:
-                raw = yf.download(
-                    batch, period=LOOKBACK_DAYS, interval="1d",
-                    group_by="ticker", progress=False, threads=True,
-                )
-                candidates = {t: (raw[t] if t in raw.columns.get_level_values(0) else pd.DataFrame())
-                              for t in batch}
-        except Exception as e:
-            print(f"[ERROR] Batch {b + 1} gagal total: {e}")
-            continue
+        candidates = {}
+        for attempt in range(BATCH_MAX_RETRIES + 1):
+            try:
+                candidates = _download_one_batch(batch)
+            except Exception as e:
+                print(f"[ERROR] Batch {b + 1} gagal total (percobaan {attempt + 1}): {e}")
+                candidates = {}
+
+            # Batch dianggap "gagal total" kalau SEMUA ticker di batch ini
+            # kosong - biasanya tanda kena rate-limit sesaat (bukan delisted
+            # beneran), jadi layak di-retry sekali dengan jeda lebih lama
+            # SEBELUM dianggap gagal permanen buat masing-masing ticker.
+            batch_all_empty = candidates and all(
+                (df is None or df.dropna(how="all").empty) for df in candidates.values()
+            )
+            if candidates and not batch_all_empty:
+                break
+            if attempt < BATCH_MAX_RETRIES:
+                print(f"[INFO] Batch {b + 1} kosong semua, retry dalam {BATCH_RETRY_DELAY_SECONDS}s...")
+                time.sleep(BATCH_RETRY_DELAY_SECONDS)
 
         for ticker, df in candidates.items():
             df = df.dropna(how="all")
@@ -159,11 +333,21 @@ def fetch_batch_data(tickers: list, batch_size: int = None, delay: float = None)
                 df.columns = df.columns.get_level_values(0)
             if not df.empty and len(df) >= 30:
                 result[ticker] = df
+                _record_fetch_result(ticker, success=True)
+            else:
+                _record_fetch_result(ticker, success=False)
+
+        if not candidates:
+            # Batch gagal total (exception terus di semua percobaan) - tetap
+            # catat miss buat tiap ticker di batch ini biar streak delisted jalan.
+            for ticker in batch:
+                _record_fetch_result(ticker, success=False)
 
         if b < total_batches - 1:
             time.sleep(delay)
 
-    print(f"[INFO] Selesai: {len(result)}/{len(tickers)} ticker berhasil diambil datanya.")
+    skip_note = f" ({skipped_delisted} dilewati krn delisted)" if skipped_delisted else ""
+    print(f"[INFO] Selesai: {len(result)}/{len(tickers_to_fetch)} ticker berhasil diambil datanya{skip_note}.")
     return result
 
 
