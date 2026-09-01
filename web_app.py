@@ -33,6 +33,11 @@ from stock_screener import (
     compute_screener_results,
     compute_fundamental_score,
     compute_trade_levels,
+    compute_position_sizing,
+    compute_fundamental_health_score,
+    compute_dcf_fair_value,
+    check_broker_averaging_trend,
+    check_entry_conditions,
     find_support_resistance,
     fetch_all_idx_tickers,
     fetch_macro_context,
@@ -1121,6 +1126,31 @@ include_buy_the_dip_single = single_col_b.checkbox(
          "cuma cek 1 hari merah paling baru dalam 30 hari terakhir (bukan tiap hari merah), "
          "jadi maksimal +1x panggilan API doang - atau 0x kalau nggak ada hari merah sama sekali.",
 )
+
+single_col_c, single_col_d = st.columns(2)
+include_fundamental_health = single_col_c.checkbox(
+    "📊 Sertakan Fundamental Health (PER/PBV/DER/ROA)", value=True,
+    help="Rasio keuangan asli dari Yahoo Finance - beda dari 'Sentimen Berita' yang cuma "
+         "baca judul berita. Ini pilar Fundamental yang sesungguhnya.",
+)
+include_dcf = single_col_d.checkbox(
+    "💰 Sertakan Estimasi DCF (Harga Wajar)", value=False,
+    help="Discounted Cash Flow 2-tahap - estimasi harga wajar saham dari proyeksi arus kas. "
+         "HASIL SANGAT SENSITIF ke asumsi growth rate & discount rate - anggap sebagai salah "
+         "satu sudut pandang, bukan patokan mutlak.",
+)
+
+with st.expander("💵 Pengaturan Position Sizing (Money Management)", expanded=False):
+    ps_col1, ps_col2 = st.columns(2)
+    modal_total_input = ps_col1.number_input(
+        "Modal trading total (Rp):", min_value=0, value=10_000_000, step=1_000_000,
+        help="Total modal yang kamu alokasikan buat trading (bukan tabungan/kebutuhan lain).",
+    )
+    risk_pct_input = ps_col2.number_input(
+        "Risiko per transaksi (%):", min_value=0.1, max_value=10.0, value=2.0, step=0.5,
+        help="Berapa persen dari MODAL TOTAL yang rela hilang kalau kena stop loss di 1 "
+             "transaksi (aturan umum: 1-2%). BUKAN persen dari harga saham.",
+    )
 if not goapi_configured:
     st.caption("⚠️ GOAPI_API_KEY belum diisi di Streamlit Secrets, atau PIN akses belum dimasukkan/benar - Broker Summary nggak akan jalan.")
 else:
@@ -1168,10 +1198,19 @@ if single_cek_button and single_ticker_input:
             screeners_single = compute_screener_results(df_single)
             tech_single = compute_signals(df_single)
             trade_levels_single = compute_trade_levels(df_single)
+            position_sizing_single = compute_position_sizing(modal_total_input, risk_pct_input, trade_levels_single)
 
             fund_single = None
             if include_news:
                 fund_single = compute_fundamental_score(ticker_full)
+
+            fund_health_single = None
+            if include_fundamental_health:
+                fund_health_single = compute_fundamental_health_score(ticker_full)
+
+            dcf_single = None
+            if include_dcf:
+                dcf_single = compute_dcf_fair_value(ticker_full)
 
             bandar_single = None
             bandar_from_cache = False
@@ -1203,12 +1242,35 @@ if single_cek_button and single_ticker_input:
                     ll_single = check_leading_lagging(ticker_full, group_batch_single)
                     break
 
+            # Checklist 4-kondisi wajib - gabungan dari pilar teknikal, fundamental,
+            # money flow, dan risk:reward yang udah dihitung di atas.
+            price_above_ma50 = (
+                len(df_single) >= 50
+                and df_single["Close"].iloc[-1] > df_single["Close"].rolling(50).mean().iloc[-1]
+            )
+            bandar_triggered = bool(
+                bandar_single and bandar_single.get("broker_accumulation", {}).get("triggered")
+            )
+            entry_check_single = check_entry_conditions(
+                price_above_ma50=price_above_ma50,
+                fundamental_score=(fund_health_single["score"]
+                                    if fund_health_single and fund_health_single.get("available") else 0),
+                fundamental_max=(fund_health_single["max_score"]
+                                  if fund_health_single and fund_health_single.get("available") else 5),
+                bandarmology_triggered=bandar_triggered,
+                risk_reward_1=trade_levels_single.get("risk_reward_1"),
+            )
+
             st.session_state.single_result = {
                 "found": True,
                 "ticker": ticker_full,
                 "screeners": screeners_single,
                 "tech": tech_single,
                 "fund": fund_single,
+                "fund_health": fund_health_single,
+                "dcf": dcf_single,
+                "position_sizing": position_sizing_single,
+                "entry_check": entry_check_single,
                 "bandar": bandar_single,
                 "bandar_from_cache": bandar_from_cache,
                 "leading_lagging": ll_single,
@@ -1254,6 +1316,90 @@ else:
     for i, (skey, sinfo) in enumerate(SCREENER_INFO.items()):
         passed = single_result["screeners"].get(skey, {}).get("passed", False)
         scr_cols[i].metric(sinfo["label"], "✅ Lolos" if passed else "❌ Tidak")
+
+    # Checklist 4-kondisi wajib - ringkasan gabungan 4 pilar sekaligus
+    if single_result.get("entry_check"):
+        ec = single_result["entry_check"]
+        st.markdown("### ✅ Checklist 4-Kondisi Wajib Sebelum Entry")
+        ec_cols = st.columns(4)
+        for i, (ckey, cval) in enumerate(ec["conditions"].items()):
+            ec_cols[i].metric(cval["label"].split(":")[0], "✅" if cval["passed"] else "❌")
+        if ec["all_met"]:
+            st.success(f"🎯 **{ec['summary']}** - semua pilar mendukung.")
+        else:
+            st.warning(f"⚠️ **{ec['summary']}** - belum semua pilar mendukung, pertimbangkan lagi sebelum entry.")
+        with st.expander("Rincian tiap kondisi", expanded=False):
+            for cval in ec["conditions"].values():
+                st.write(("✅ " if cval["passed"] else "❌ ") + cval["label"])
+
+    # Fundamental Health Score - rasio keuangan asli (PER/PBV/DER/ROA)
+    if single_result.get("fund_health"):
+        fh = single_result["fund_health"]
+        st.markdown("### 📊 Fundamental Health Score")
+        if not fh.get("available"):
+            st.caption(f"⚠️ {fh.get('error', 'Data fundamental tidak tersedia untuk saham ini.')}")
+        else:
+            st.info(f"**{fh['summary']}**")
+            fh_rows = [{"Kriteria": c["label"], "Status": "✅ Lolos" if c["passed"] else "❌ Tidak", "Nilai": c["value"]}
+                       for c in fh["checks"].values()]
+            st.dataframe(pd.DataFrame(fh_rows), width='stretch', hide_index=True)
+            st.caption(
+                "Ini pilar Fundamental yang sesungguhnya (rasio keuangan asli dari Yahoo Finance) - "
+                "beda dari 'Sentimen Berita' di atas yang cuma baca judul berita terkini."
+            )
+
+    # DCF Fair Value
+    if single_result.get("dcf"):
+        dcf = single_result["dcf"]
+        st.markdown("### 💰 Estimasi Harga Wajar (DCF)")
+        if not dcf.get("available"):
+            st.caption(f"⚠️ {dcf.get('error', 'DCF tidak bisa dihitung untuk saham ini.')}")
+        else:
+            dcf_c1, dcf_c2, dcf_c3 = st.columns(3)
+            dcf_c1.metric("Harga Wajar (DCF)", f"Rp{dcf['fair_value']:,.0f}" if dcf['fair_value'] else "-")
+            dcf_c2.metric("Harga Sekarang", f"Rp{dcf['current_price']:,.0f}" if dcf['current_price'] else "-")
+            mos_display = f"{dcf['mos_pct']:.1f}%" if dcf.get("mos_pct") is not None else "-"
+            dcf_c3.metric("Margin of Safety", mos_display)
+            if dcf.get("harga_beli_ideal_mos30"):
+                st.caption(f"Harga beli ideal (target MOS 30%): **Rp{dcf['harga_beli_ideal_mos30']:,.0f}**")
+            st.caption(
+                f"Asumsi dipakai: growth tahap 1 = {dcf['assumptions']['growth1']*100:.0f}%, "
+                f"growth tahap 2 = {dcf['assumptions']['growth2']*100:.0f}%, "
+                f"discount rate = {dcf['assumptions']['discount']*100:.0f}%, "
+                f"terminal growth = {dcf['assumptions']['terminal']*100:.1f}%."
+            )
+            st.warning(f"⚠️ {dcf['note']}")
+
+    # Position Sizing & Strategi 2-3-5
+    if single_result.get("position_sizing"):
+        ps = single_result["position_sizing"]
+        st.markdown("### 💵 Position Sizing & Strategi Entry Bertahap")
+        if ps.get("too_risky"):
+            st.error(
+                "🚫 Dengan modal & toleransi risiko saat ini, jarak ke Stop Loss kebesaran - "
+                "0 lot yang direkomendasikan. Coba perbesar modal, perbesar toleransi risiko, "
+                "atau cari saham dengan jarak SL lebih rapat."
+            )
+        else:
+            ps_c1, ps_c2, ps_c3 = st.columns(3)
+            ps_c1.metric("Maksimal Lot", f"{ps['max_lot']} lot")
+            ps_c2.metric("Nilai Posisi", f"Rp{ps['actual_position_rp']:,.0f}")
+            ps_c3.metric("% dari Modal", f"{ps['pct_of_modal']:.1f}%")
+            st.caption(
+                f"Risiko yang rela ditanggung: Rp{ps['risiko_rp']:,.0f} ({ps['risk_pct']}% dari modal), "
+                f"jarak ke Stop Loss: {ps['jarak_cutloss_pct']:.1f}%."
+            )
+            st.markdown("**Strategi Entry Bertahap 2-3-5:**")
+            plan = ps["plan_2_3_5"]
+            plan_cols = st.columns(3)
+            plan_cols[0].metric("Entry Awal (20%)", f"{plan['entry_awal_20pct']['lot']} lot")
+            plan_cols[1].metric("Konfirmasi (30%)", f"{plan['konfirmasi_30pct']['lot']} lot")
+            plan_cols[2].metric("Cadangan (50%)", f"{plan['cadangan_50pct']['lot']} lot")
+            st.caption(
+                "Masuk sedikit dulu (20%), tambah kalau harga konfirmasi arah (30%), sisanya "
+                "(50%) jadi cadangan buat nambah posisi kalau makin yakin atau buat DCA "
+                "kalau strateginya emang averaging."
+            )
 
     if single_result.get("leading_lagging"):
         ll = single_result["leading_lagging"]
@@ -1327,6 +1473,32 @@ else:
             bc3.metric("Net Retail (Rp)", f"{acc.get('total_retail_net', 0):,.0f}")
         else:
             st.caption("Data mentah broker per kode nggak tersedia (cek kuota/koneksi GoAPI).")
+
+        top_buyer_code = acc.get("top_buyer")
+        if top_buyer_code:
+            with st.expander(f"📈 Cek Averaging Trend Broker {top_buyer_code} (opsional, boros API)", expanded=False):
+                st.caption(
+                    "Cek apakah broker top-buyer ini lagi 'averaging UP' (harga rata-rata "
+                    "belinya naik dari hari ke hari - sinyal makin yakin) atau 'averaging "
+                    "DOWN' (kurang meyakinkan) selama beberapa hari terakhir. "
+                    "⚠️ Ini manggil API sebanyak jumlah hari yang dicek (default 5x) - "
+                    "jauh lebih boros dari Broker Summary biasa, makanya terpisah & manual."
+                )
+                avg_days = st.slider("Jumlah hari yang dicek:", min_value=2, max_value=10, value=5,
+                                      key="avg_trend_days")
+                if st.button(f"🔍 Cek Averaging Trend Broker {top_buyer_code}", key="btn_avg_trend"):
+                    with st.spinner(f"Mengecek {avg_days} hari terakhir buat broker {top_buyer_code}..."):
+                        avg_result = check_broker_averaging_trend(ticker, top_buyer_code, lookback_days=avg_days)
+                    if avg_result["trend"] == "data_kurang":
+                        st.warning(avg_result["detail"])
+                    else:
+                        signal_icon = "🟢" if avg_result["signal"] == "positif_kuat" else "🟡"
+                        st.info(f"{signal_icon} {avg_result['detail']}")
+                        if avg_result.get("dates") and avg_result.get("avg_prices"):
+                            st.dataframe(
+                                pd.DataFrame({"Tanggal": avg_result["dates"], "Harga Rata-Rata Beli (Rp)": avg_result["avg_prices"]}),
+                                width='stretch', hide_index=True,
+                            )
 
         with st.expander("📚 Tabel Referensi Klasifikasi Broker (buat validasi manual)", expanded=False):
             st.caption(
@@ -1418,6 +1590,40 @@ else:
     lc4.metric("Take Profit 2", f"{trade_levels_single['take_profit_2']:,.0f}",
                delta=f"{(trade_levels_single['take_profit_2']/trade_levels_single['price']-1)*100:.1f}%")
 
+    st.markdown("---")
+    st.markdown("#### 📓 Trading Journal Manual")
+    st.caption(
+        "Catatan pribadi kamu soal transaksi saham ini - BEDA dari riwayat screening "
+        "otomatis di atas (yang itu log sistem, ini catatan kamu sendiri). Isi SETELAH "
+        "kamu beneran entry/exit, biar ada rekam jejak psikologi trading kamu."
+    )
+    with st.form(key="journal_form", clear_on_submit=True):
+        j_col1, j_col2 = st.columns(2)
+        j_harga_beli = j_col1.number_input("Harga Beli (Rp):", min_value=0.0, value=0.0, step=1.0)
+        j_harga_jual = j_col2.number_input("Harga Jual (Rp) - kosongkan/0 kalau belum exit:", min_value=0.0, value=0.0, step=1.0)
+        j_alasan_entry = st.text_area("Alasan Entry:", placeholder="Kenapa kamu masuk di sini? Sinyal apa yang meyakinkan?")
+        j_catatan_psikologi = st.text_area("Catatan Psikologi:", placeholder="Ada FOMO? Panic? Yakin penuh? Ragu-ragu?")
+        j_submit = st.form_submit_button("💾 Simpan ke Trading Journal")
+
+        if j_submit:
+            pct_pl = None
+            if j_harga_beli > 0 and j_harga_jual > 0:
+                pct_pl = (j_harga_jual - j_harga_beli) / j_harga_beli * 100
+            journal_data = {
+                "harga_beli": j_harga_beli or None,
+                "harga_jual": j_harga_jual or None,
+                "pct_pl": round(pct_pl, 2) if pct_pl is not None else None,
+                "alasan_entry": j_alasan_entry,
+                "catatan_psikologi": j_catatan_psikologi,
+            }
+            _append_history_row(
+                mode="journal", ticker=ticker,
+                harga=j_harga_beli or 0, rsi=0,
+                screener_lolos="-", broker_status="-",
+                data_obj=journal_data,
+            )
+            st.success("✅ Tersimpan ke Trading Journal!")
+
 
 # --- Riwayat Screening Hari Ini (di luar blok if, biar selalu kelihatan) ---
 st.markdown("#### 📜 Riwayat Screening Satu Saham Hari Ini")
@@ -1442,6 +1648,39 @@ if _hist_rows_today:
     )
 else:
     st.caption("Belum ada saham yang di-screening hari ini.")
+
+
+# --- Riwayat Trading Journal (semua waktu, bukan cuma hari ini) ---
+st.markdown("---")
+st.markdown("#### 📓 Riwayat Trading Journal Kamu")
+_journal_rows = _read_history_rows(mode="journal")
+if _journal_rows:
+    journal_display = []
+    for r in reversed(_journal_rows[-30:]):  # 30 entri terakhir, biar nggak kepanjangan
+        try:
+            jd = json.loads(r.get("DataJSON") or "{}")
+        except Exception:
+            jd = {}
+        journal_display.append({
+            "Waktu": r.get("Waktu"), "Ticker": r.get("Ticker"),
+            "Harga Beli": f"{jd.get('harga_beli'):,.0f}" if jd.get("harga_beli") else "-",
+            "Harga Jual": f"{jd.get('harga_jual'):,.0f}" if jd.get("harga_jual") else "-",
+            "P/L (%)": f"{jd.get('pct_pl'):+.1f}%" if jd.get("pct_pl") is not None else "-",
+            "Alasan Entry": jd.get("alasan_entry") or "-",
+            "Catatan Psikologi": jd.get("catatan_psikologi") or "-",
+        })
+    st.dataframe(pd.DataFrame(journal_display), width='stretch', hide_index=True)
+    _pl_values = [jd["pct_pl"] for r in _journal_rows
+                  if (jd := (json.loads(r.get("DataJSON") or "{}") if r.get("DataJSON") else {})).get("pct_pl") is not None]
+    if _pl_values:
+        win_count = sum(1 for p in _pl_values if p > 0)
+        st.caption(
+            f"Dari {len(_pl_values)} transaksi yang udah ditutup (ada harga beli & jual): "
+            f"{win_count} untung, {len(_pl_values) - win_count} rugi, rata-rata P/L "
+            f"{sum(_pl_values)/len(_pl_values):+.1f}%."
+        )
+else:
+    st.caption("Belum ada entri Trading Journal. Isi form di atas setelah kamu entry/exit saham.")
 
 
 # =========================================================================
