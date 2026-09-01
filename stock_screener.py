@@ -1896,8 +1896,7 @@ def check_entry_conditions(price_above_ma50: bool, fundamental_score: int, funda
         "summary": f"{met_count}/4 kondisi wajib terpenuhi" + (" - siap entry" if met_count == 4 else ""),
     }
 
-
-
+def compute_bandarmology_score(ticker: str, df: pd.DataFrame, include_buy_the_dip: bool = False) -> dict:
     """
     Skor tambahan dari data broker summary GoAPI - OPSIONAL, cuma jalan
     kalau GOAPI_API_KEY udah diisi. Ini yang dipanggil dari web app / script
