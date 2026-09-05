@@ -795,6 +795,16 @@ include_macro = st.sidebar.checkbox(
          "pagi Nikkei & KOSPI. Cuma dicek sekali per klik screening, bukan per saham.",
 )
 
+include_fundamental_health_massal = st.sidebar.checkbox(
+    "📊 Sertakan Fundamental Health (PER/PBV/DER/ROA)",
+    value=False,
+    help="Pilar Fundamental sungguhan (rasio keuangan asli dari Yahoo Finance), BUKAN cuma "
+         "sentimen berita. GRATIS (nggak pakai kuota GoAPI), tapi nambah 1 request per saham "
+         "yang LOLOS screener - bisa nambah waktu proses kalau saham yang lolos banyak. "
+         "Kalau ada saham yang datanya gagal ditarik, otomatis di-skip (nggak bikin error, "
+         "cuma skor fundamentalnya kosong buat saham itu).",
+)
+
 goapi_configured = "ISI_" not in GOAPI_API_KEY and bool(GOAPI_API_KEY)
 
 # =========================================================================
@@ -839,17 +849,21 @@ elif goapi_configured and not GOAPI_ACCESS_PIN:
 # Summary tetap disabled walaupun API key-nya udah keisi.
 goapi_configured = goapi_configured and (not GOAPI_ACCESS_PIN or st.session_state.goapi_unlocked)
 
-include_bandarmology = False  # Broker Summary (GoAPI) SENGAJA dimatikan buat mode Screening
-                               # Massal - biar kuota API nggak kepakai per-saham x puluhan
-                               # saham. Fitur ini cuma bisa diaktifkan di bagian
-                               # "🔎 Screening Satu Saham" di bawah, biar hasilnya per saham
-                               # bisa dijelaskan & divalidasi detail satu-satu.
-st.sidebar.caption(
-    "📡 Broker Summary (GoAPI) nggak tersedia di mode ini biar kuota API nggak boros "
-    "kalau nge-scan banyak saham sekaligus. Buka bagian **'🔎 Screening Satu Saham'** "
-    "di bawah kalau mau lihat data broker summary lengkap + validasinya per saham."
-    + ("" if "ISI_" not in GOAPI_API_KEY and bool(GOAPI_API_KEY) else " (API key GoAPI juga belum diisi di Streamlit Secrets.)")
+include_bandarmology = st.sidebar.checkbox(
+    "📡 Sertakan Money Flow / Broker Summary (GoAPI) ⚠️",
+    value=False,
+    disabled=not goapi_configured,
+    help="Pilar Money Flow (bandarmology) buat mode Screening Massal. HANYA jalan buat saham "
+         "yang UDAH LOLOS screener (bukan semua ~900 saham) - tapi tetap bisa lumayan boros "
+         "kuota GoAPI kalau banyak yang lolos, makanya dibatasi ke Top 15 by skor. Kalau ada "
+         "yang gagal/kuota habis, otomatis di-skip per saham (nggak bikin proses berhenti).",
 )
+if not goapi_configured:
+    st.sidebar.caption(
+        "📡 Broker Summary (GoAPI) butuh API key di Streamlit Secrets"
+        + (" + PIN akses yang bener." if GOAPI_ACCESS_PIN else ".")
+    )
+MAX_BANDARMOLOGY_MASSAL = 15  # batas keras jumlah saham yang dicek Money Flow di mode massal
 
 run_button = st.sidebar.button("🔍 Jalankan Screening", type="primary", width='stretch')
 
@@ -865,6 +879,8 @@ if "results" not in st.session_state:
     st.session_state.chart_data = {}
     st.session_state.trade_levels_map = {}
     st.session_state.macro_context = None
+    st.session_state.fund_health_map = {}
+    st.session_state.bandar_map = {}
 
 if run_button:
     if not active_screeners:
@@ -955,8 +971,55 @@ if run_button:
                 "_screener_keys": [s for s in active_screeners if screeners.get(s, {}).get("passed")],
             })
 
+    # =====================================================================
+    # PILAR FUNDAMENTAL & MONEY FLOW - dijalankan SETELAH screening utama
+    # selesai, HANYA buat saham yang udah lolos (bukan semua ~900 saham).
+    # Dibungkus try/except per saham biar 1 saham gagal nggak nghentiin
+    # proses buat saham lain ("jangan sampai error").
+    # =====================================================================
+    fund_health_map = {}
+    bandar_map = {}
+
+    if include_fundamental_health_massal and results:
+        fh_progress = st.progress(0, text="Menghitung Fundamental Health per saham...")
+        for i, r in enumerate(results):
+            fh_progress.progress((i + 1) / len(results), text=f"Fundamental Health: {r['Ticker']} ({i+1}/{len(results)})")
+            try:
+                fh = compute_fundamental_health_score(r["Ticker"])
+            except Exception as e:
+                fh = {"available": False, "error": str(e), "score": 0, "max_score": 5}
+            fund_health_map[r["Ticker"]] = fh
+            if fh.get("available"):
+                r["Skor"] += fh["score"]
+                r["Fundamental"] = fh["summary"]
+            else:
+                r["Fundamental"] = "Data nggak tersedia"
+        fh_progress.empty()
+
+    if include_bandarmology and goapi_configured and results:
+        # cuma cek Top N by skor SAAT INI (sebelum bonus fundamental di atas
+        # ikut dihitung juga nggak masalah, tetap top saham yang paling relevan)
+        top_for_bandar = sorted(results, key=lambda r: r["Skor"], reverse=True)[:MAX_BANDARMOLOGY_MASSAL]
+        bd_progress = st.progress(0, text="Mengecek Money Flow (GoAPI) per saham...")
+        for i, r in enumerate(top_for_bandar):
+            bd_progress.progress((i + 1) / len(top_for_bandar),
+                                  text=f"Money Flow: {r['Ticker']} ({i+1}/{len(top_for_bandar)})")
+            try:
+                bandar = compute_bandarmology_score(r["Ticker"], chart_data.get(r["Ticker"]))
+            except Exception as e:
+                bandar = {"available": False, "error": str(e), "score": 0, "reasons": []}
+            bandar_map[r["Ticker"]] = bandar
+            if bandar.get("available"):
+                r["Skor"] += bandar["score"]
+                r["Money Flow"] = "; ".join(bandar["reasons"]) if bandar["reasons"] else "Nggak ada sinyal akumulasi"
+            else:
+                r["Money Flow"] = "Data nggak tersedia"
+        bd_progress.empty()
+
     progress_bar.empty()
     st.session_state.results = pd.DataFrame(results)
+    st.session_state.fund_health_map = fund_health_map
+    st.session_state.bandar_map = bandar_map
     st.session_state.evidence_map = evidence_map
     st.session_state.indicators_map = indicators_map
     st.session_state.chart_data = chart_data
@@ -1023,7 +1086,12 @@ if st.session_state.results is not None:
 
     st.subheader("Kandidat Hasil Screening")
     if len(df_results) > 0:
-        display_cols = ["Ticker", "Harga", "Skor", "RSI", "Lolos Screener", "Alasan", "Link Berita"]
+        display_cols = ["Ticker", "Harga", "Skor", "RSI", "Lolos Screener"]
+        if "Fundamental" in df_results.columns:
+            display_cols.append("Fundamental")
+        if "Money Flow" in df_results.columns:
+            display_cols.append("Money Flow")
+        display_cols += ["Alasan", "Link Berita"]
         col_config = {
             "Harga": st.column_config.NumberColumn(format="%d"),
             "Link Berita": st.column_config.LinkColumn("Cek Berita Manual", display_text="🔗 Buka"),
@@ -1087,11 +1155,34 @@ if st.session_state.results is not None:
             else:
                 st.caption(f"🔗 Leading-Lagging: {ll['value']}")
 
-        if goapi_configured:
+        if pilihan_ticker in st.session_state.get("fund_health_map", {}):
+            fh = st.session_state.fund_health_map[pilihan_ticker]
+            st.markdown("##### 📊 Fundamental Health")
+            if not fh.get("available"):
+                st.caption(f"⚠️ {fh.get('error', 'Data fundamental tidak tersedia.')}")
+            else:
+                st.info(f"**{fh['summary']}**")
+                fh_rows = [{"Kriteria": c["label"], "Status": "✅ Lolos" if c["passed"] else "❌ Tidak", "Nilai": c["value"]}
+                           for c in fh["checks"].values()]
+                st.dataframe(pd.DataFrame(fh_rows), width='stretch', hide_index=True)
+
+        if pilihan_ticker in st.session_state.get("bandar_map", {}):
+            bandar = st.session_state.bandar_map[pilihan_ticker]
+            st.markdown("##### 📡 Money Flow (Broker Summary)")
+            if not bandar.get("available"):
+                st.caption(f"⚠️ {bandar.get('error', 'Data money flow tidak tersedia.')}")
+            elif bandar["reasons"]:
+                for r in bandar["reasons"]:
+                    st.info(r)
+            else:
+                st.caption("Nggak ada sinyal akumulasi smart money terdeteksi.")
+        elif goapi_configured and include_bandarmology:
+            st.caption(f"📡 **{pilihan_ticker}** nggak masuk Top {MAX_BANDARMOLOGY_MASSAL} yang dicek Money Flow-nya.")
+        elif goapi_configured:
             st.caption(
-                f"📡 Mau lihat data Broker Summary buat **{pilihan_ticker}**? Buka bagian "
-                "**'🔎 Screening Satu Saham'** di bawah, ketik kodenya di sana - broker "
-                "summary cuma jalan per-saham biar kuota GoAPI-nya hemat."
+                f"📡 Mau lihat data Broker Summary buat **{pilihan_ticker}**? Centang "
+                "**'Sertakan Money Flow / Broker Summary'** di sidebar sebelum Jalankan Screening, "
+                "atau buka bagian **'🔎 Screening Satu Saham'** di bawah buat cek satu-satu."
             )
 
         criteria_options = ["(Nggak ada yang dipilih - tampilan grafik biasa)"]
