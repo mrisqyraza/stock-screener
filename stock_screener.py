@@ -110,6 +110,41 @@ BATCH_MAX_RETRIES = 1  # berapa kali retry per batch kalau kena gagal total/koso
 DELISTED_CACHE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "delisted_tickers.json")
 DELISTED_MISS_THRESHOLD = 3  # gagal berturut-turut sebanyak ini baru ditandai delisted otomatis
 
+# =========================================================================
+# DAFTAR STATIS dari riset manual (Daftar_Saham_Delisting_BEI_v2.xlsx,
+# per 2 September 2026) - digabung sama auto-detect di atas. Ini yang bikin
+# exclude-nya LANGSUNG jalan dari awal, nggak perlu nunggu 3x gagal fetch
+# dulu, dan tetap kepakai walaupun cache lokal (DELISTED_CACHE_FILE) ke-reset
+# pas Streamlit Cloud redeploy (filesystem-nya nggak permanen).
+#
+# Dua kategori beda sifatnya:
+# - RESMI: udah dikonfirmasi delisting (62 emiten/waran)
+# - BERPOTENSI: masih disuspensi >=6 bulan per pengumuman BEI, BELUM RESMI
+#   delisting - statusnya bisa berubah (pulih atau lanjut delisting resmi).
+#   Tetap di-exclude buat sekarang karena harga sahamnya nggak update (nggak
+#   ada gunanya di-screening), tapi kalau nanti pulih & aktif lagi, hapus
+#   manual dari daftar ini.
+DELISTED_RESMI_TICKERS = [
+    "MAMI", "KPAS", "JKSW", "KRAH", "HDTX", "PRAS", "KPAL", "NIPS", "FORZ", "MYRX",
+    "FREN", "BORN", "CKRA", "ITTG", "GREN", "SCBD", "NAGA", "SIAP", "ATPK", "BBNP",
+    "GMCW", "TMPI", "CPGT", "BRAU", "SQBB", "DAVO", "ASIA", "JAKA", "APEX", "JASS",
+    "MACO", "SING", "BUKK", "AQUA", "MASA", "COWL", "MTRA", "SRIL", "TOYS", "SBAT",
+    "TDPM", "TELE", "DUCK", "APOL", "BAEK", "CTRP", "CTRS", "DAJK", "FINN", "INVS",
+    "JPRS", "LAMI", "RMBA", "SOBI", "TKGA", "TRUB", "TURI", "UNTX", "MBAI", "RINA", "SIIP",
+]
+BERPOTENSI_DELISTING_TICKERS = [
+    "ALMI", "ARMY", "ARTI", "BEBS", "BIKA", "BOSS", "BTEL", "CBMF", "CPRI", "DEAL",
+    "ENVY", "ETWA", "FASW", "GAMA", "GOLL", "HKMU", "HOME", "HOTL", "IIKP", "INAF",
+    "IPPE", "JSKY", "KAYU", "KBRI", "LCGP", "LMAS", "MABA", "MAGP", "MKNT", "NUSA",
+    "PLAS", "POLL", "POOL", "POSA", "PPRO", "PURE", "RIMO", "SIMA",
+]
+STATIC_DELISTED_TICKERS = {
+    f"{code}.JK": "Delisting Resmi" for code in DELISTED_RESMI_TICKERS
+}
+STATIC_DELISTED_TICKERS.update({
+    f"{code}.JK": "Berpotensi Delisting (masih disuspensi)" for code in BERPOTENSI_DELISTING_TICKERS
+})
+
 
 def _load_delisted_store() -> dict:
     if not os.path.exists(DELISTED_CACHE_FILE):
@@ -135,11 +170,19 @@ def _save_delisted_store(data: dict):
 
 
 def get_delisted_tickers() -> dict:
-    """Balikin dict {ticker: {tanggal_ditandai, alasan}} - semua saham yang udah ditandai delisted."""
-    return _load_delisted_store()["delisted"]
+    """
+    Balikin dict {ticker: {tanggal_ditandai, alasan}} - GABUNGAN dari daftar
+    statis (riset manual dari Excel) DAN yang ke-auto-detect sistem.
+    """
+    combined = {code: {"tanggal_ditandai": "-", "alasan": alasan}
+                for code, alasan in STATIC_DELISTED_TICKERS.items()}
+    combined.update(_load_delisted_store()["delisted"])  # auto-detect nimpa kalau ada info lebih baru
+    return combined
 
 
 def is_ticker_delisted(ticker: str) -> bool:
+    if ticker in STATIC_DELISTED_TICKERS:
+        return True
     return ticker in _load_delisted_store()["delisted"]
 
 
@@ -240,6 +283,18 @@ def fetch_all_idx_tickers(exclude_boards: list = None) -> list:
         df = df[~df["listingBoard"].isin(exclude_boards)]
 
     tickers = [f"{code.strip()}.JK" for code in df["code"].astype(str)]
+
+    # Buang saham yang udah ketauan delisted/disuspensi lama (gabungan
+    # daftar statis dari riset manual + auto-detect sistem) - biar nggak
+    # buang-buang waktu/kuota fetch buat saham yang emang nggak ada
+    # datanya. Ini yang bikin permintaan "jangan discreening lagi" jalan
+    # dari titik paling awal, bukan cuma di-skip belakangan pas fetch.
+    before_count = len(tickers)
+    tickers = [t for t in tickers if not is_ticker_delisted(t)]
+    excluded_count = before_count - len(tickers)
+    if excluded_count > 0:
+        print(f"[INFO] {excluded_count} ticker di-exclude dari watchlist karena delisted/disuspensi.")
+
     return tickers
 
 
@@ -1586,8 +1641,7 @@ def compute_dcf_fair_value(ticker: str, growth1: float = 0.10, growth2: float = 
         ),
     }
 
-
-
+def compute_sentiment_score(ticker: str) -> dict:
     """
     Placeholder terpisah buat sentimen sosial media (beda dari berita resmi).
     Belum diimplementasi - butuh data platform sosial media yang biasanya
